@@ -3,3 +3,4 @@ pyswisseph
 httpx
 uvicorn
 timezonefinder==6.5.0
+tzdata

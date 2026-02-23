@@ -3,6 +3,7 @@ from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
 import traceback
+import time as time_module
 from datetime import date, datetime, time
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -98,6 +99,19 @@ HOUSE_SYSTEM_CODE = {
     "placidus": b"P",
 }
 TIMEZONE_FINDER = TimezoneFinder(in_memory=True)
+GEOCODE_HEADERS = {"User-Agent": "AstroGPT/1.0 (contact: admin@yourdomain.com)"}
+US_COUNTRY_ALIASES = {
+    "us",
+    "usa",
+    "u s",
+    "u s a",
+    "u.s",
+    "u.s.",
+    "u.s.a",
+    "u.s.a.",
+    "united states",
+    "united states of america",
+}
 
 
 def sanity_check_ephemeris() -> None:
@@ -153,105 +167,174 @@ def calc_longitude(jd: float, body: int, flag: Optional[int] = None) -> float:
     return xx[0]
 
 
-@lru_cache(maxsize=512)
+def _normalize_location_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return " ".join(
+        "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in value).split()
+    )
+
+
+def _normalize_country_key(value: Optional[str]) -> str:
+    normalized = _normalize_location_text(value)
+    if normalized in US_COUNTRY_ALIASES:
+        return "us"
+    letters = "".join(ch for ch in normalized if ch.isalpha())
+    if len(letters) == 2 and letters == "us":
+        return "us"
+    return normalized
+
+
+def _country_code_from_key(country_key: str) -> Optional[str]:
+    if not country_key:
+        return None
+    if country_key == "us":
+        return "US"
+    letters = "".join(ch for ch in country_key.upper() if ch.isalpha())
+    return letters if len(letters) == 2 else None
+
+
+def _display_name_for(candidate: Dict[str, Any], fallback_city: str) -> str:
+    parts = [candidate.get("name"), candidate.get("admin1"), candidate.get("country")]
+    cleaned = [str(part).strip() for part in parts if part and str(part).strip()]
+    return ", ".join(cleaned) if cleaned else fallback_city
+
+
+def _score_candidate(
+    candidate: Dict[str, Any],
+    city_key: str,
+    state_key: str,
+    country_key: str,
+    country_code: Optional[str],
+) -> int:
+    points = 0
+
+    candidate_country_code = str(candidate.get("country_code", "")).upper()
+    candidate_country_name = _normalize_country_key(candidate.get("country"))
+    candidate_admin1 = _normalize_location_text(candidate.get("admin1"))
+    candidate_city = _normalize_location_text(candidate.get("name"))
+
+    if country_key:
+        if country_code and candidate_country_code == country_code:
+            points += 3
+        elif (
+            candidate_country_name
+            and (
+                candidate_country_name == country_key
+                or country_key in candidate_country_name
+                or candidate_country_name in country_key
+            )
+        ):
+            points += 3
+
+    if state_key:
+        if (
+            candidate_admin1
+            and (
+                candidate_admin1 == state_key
+                or state_key in candidate_admin1
+                or candidate_admin1 in state_key
+            )
+        ):
+            points += 3
+
+    if city_key and candidate_city == city_key:
+        points += 1
+
+    return points
+
+
+@lru_cache(maxsize=2048)
+def _geocode_cached(city_key: str, state_key: str, country_key: str) -> Tuple[float, float, str]:
+    retries = [0.5, 1.0, 2.0]
+    country_code = _country_code_from_key(country_key)
+    last_status: Optional[int] = None
+
+    for attempt in range(len(retries) + 1):
+        try:
+            response = httpx.get(
+                OPEN_METEO_GEOCODE_URL,
+                params={"name": city_key, "count": 5, "language": "en", "format": "json"},
+                headers=GEOCODE_HEADERS,
+                timeout=10.0,
+            )
+            status_code = response.status_code
+            if status_code == 429:
+                last_status = 429
+                if attempt < len(retries):
+                    time_module.sleep(retries[attempt])
+                    continue
+                raise HTTPException(
+                    status_code=503,
+                    detail="Geocoding is temporarily rate-limited. Please retry in ~30 seconds.",
+                )
+            if 500 <= status_code <= 599:
+                last_status = status_code
+                if attempt < len(retries):
+                    time_module.sleep(retries[attempt])
+                    continue
+            response.raise_for_status()
+            payload = response.json()
+            results = payload.get("results") or []
+            if not results:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not resolve location. Please confirm City + State/Province + Country.",
+                )
+            best = max(
+                results,
+                key=lambda cand: (
+                    _score_candidate(cand, city_key, state_key, country_key, country_code),
+                    int(cand.get("population") or 0),
+                ),
+            )
+            lat = float(best["latitude"])
+            lon = float(best["longitude"])
+            return lat, lon, _display_name_for(best, city_key)
+        except HTTPException:
+            raise
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Geocoding is temporarily rate-limited. Please retry in ~30 seconds.",
+                ) from exc
+            raise HTTPException(
+                status_code=400,
+                detail="Could not resolve location. Please confirm City + State/Province + Country.",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not resolve location. Please confirm City + State/Province + Country.",
+            ) from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not resolve location. Please confirm City + State/Province + Country.",
+            ) from exc
+
+    if last_status == 429:
+        raise HTTPException(
+            status_code=503,
+            detail="Geocoding is temporarily rate-limited. Please retry in ~30 seconds.",
+        )
+    raise HTTPException(
+        status_code=400,
+        detail="Could not resolve location. Please confirm City + State/Province + Country.",
+    )
+
+
 def geocode_place(city: str, state: Optional[str], country: str) -> Tuple[float, float, str]:
-    def normalize(value: Optional[str]) -> str:
-        if not value:
-            return ""
-        return " ".join(
-            "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in value).split()
-        )
-
-    def normalize_country_code(value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-        letters = "".join(ch for ch in value.upper() if ch.isalpha())
-        return letters if len(letters) == 2 else None
-
-    def display_name_for(candidate: Dict[str, Any]) -> str:
-        parts = [candidate.get("name"), candidate.get("admin1"), candidate.get("country")]
-        cleaned = [str(part).strip() for part in parts if part and str(part).strip()]
-        return ", ".join(cleaned) if cleaned else city
-
-    city_norm = normalize(city)
-    state_norm = normalize(state)
-    country_norm = normalize(country)
-    country_code = normalize_country_code(country)
-
-    params = {
-        "name": city,
-        "count": 5,
-        "language": "en",
-        "format": "json",
-    }
-    try:
-        response = httpx.get(OPEN_METEO_GEOCODE_URL, params=params, timeout=10.0)
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not resolve location. Please confirm City + State/Province + Country.",
-        ) from exc
-
-    payload = response.json()
-    results = payload.get("results") or []
-    if not results:
+    city_key = _normalize_location_text(city)
+    state_key = _normalize_location_text(state)
+    country_key = _normalize_country_key(country)
+    if not city_key or not country_key:
         raise HTTPException(
             status_code=400,
             detail="Could not resolve location. Please confirm City + State/Province + Country.",
         )
-
-    def score(candidate: Dict[str, Any]) -> int:
-        points = 0
-
-        candidate_country_code = str(candidate.get("country_code", "")).upper()
-        candidate_country_name = normalize(candidate.get("country"))
-        candidate_admin1 = normalize(candidate.get("admin1"))
-        candidate_city = normalize(candidate.get("name"))
-
-        if country:
-            if country_code and candidate_country_code == country_code:
-                points += 3
-            elif (
-                country_norm
-                and candidate_country_name
-                and (
-                    candidate_country_name == country_norm
-                    or country_norm in candidate_country_name
-                    or candidate_country_name in country_norm
-                )
-            ):
-                points += 3
-
-        if state:
-            if (
-                state_norm
-                and candidate_admin1
-                and (
-                    candidate_admin1 == state_norm
-                    or state_norm in candidate_admin1
-                    or candidate_admin1 in state_norm
-                )
-            ):
-                points += 3
-
-        if city_norm and candidate_city == city_norm:
-            points += 1
-
-        return points
-
-    best = max(results, key=lambda cand: (score(cand), int(cand.get("population") or 0)))
-
-    try:
-        lat = float(best["latitude"])
-        lon = float(best["longitude"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not resolve location. Please confirm City + State/Province + Country.",
-        ) from exc
-
-    return lat, lon, display_name_for(best)
+    return _geocode_cached(city_key, state_key, country_key)
 
 
 @lru_cache(maxsize=512)
@@ -368,8 +451,8 @@ def compute_natal_chart(
     timezone_source = "input" if timezone_offset_hours is not None else None
 
     if birth_time is not None:
-        timezone_name = lookup_timezone_name(round(birth_lat, 4), round(birth_lon, 4))
         if timezone_offset_hours is None:
+            timezone_name = lookup_timezone_name(round(birth_lat, 4), round(birth_lon, 4))
             timezone_offset_hours, timezone_name = resolve_timezone_offset_hours(
                 birth_lat, birth_lon, birth_date, birth_time, tz_name=timezone_name
             )
@@ -451,7 +534,7 @@ def compute_natal_chart_cached(
     house_system: Literal["whole_sign", "placidus"],
 ) -> Dict[str, Any]:
     location_input = ", ".join([part for part in [city, state, country] if part])
-    birth_lat, birth_lon, _display_name = geocode_place(city, state, country)
+    birth_lat, birth_lon, resolved_name = geocode_place(city, state, country)
     return compute_natal_chart(
         birth_date=birth_date,
         birth_time=birth_time,
@@ -464,7 +547,7 @@ def compute_natal_chart_cached(
         birth_lat=birth_lat,
         birth_lon=birth_lon,
         timezone_offset_hours=None,
-        location_resolved=location_input,
+        location_resolved=resolved_name,
     )
 
 
@@ -517,8 +600,9 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
         if p.lat is not None and p.lon is not None:
             birth_lat = p.lat
             birth_lon = p.lon
+            location_resolved = location_input
         else:
-            birth_lat, birth_lon, _display_name = geocode_place(p.city, p.state, p.country)
+            birth_lat, birth_lon, location_resolved = geocode_place(p.city, p.state, p.country)
 
         return compute_natal_chart(
             birth_date=p.date,
@@ -532,7 +616,7 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
             birth_lat=birth_lat,
             birth_lon=birth_lon,
             timezone_offset_hours=p.timezone_offset_hours,
-            location_resolved=location_input,
+            location_resolved=location_resolved,
         )
 
     except HTTPException:
