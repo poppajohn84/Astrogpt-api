@@ -1,4 +1,6 @@
+import copy
 from functools import lru_cache
+from itertools import combinations
 from pathlib import Path
 import traceback
 from datetime import date, datetime, time
@@ -7,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+from timezonefinder import TimezoneFinder
 try:
     import swisseph as swe
 except Exception:
@@ -83,7 +86,18 @@ SIGNS = [
 ]
 
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-TIMEZONE_LOOKUP_URL = "https://api.open-meteo.com/v1/forecast"
+ASPECT_SPECS = (
+    ("conjunction", 0.0, 8.0),
+    ("sextile", 60.0, 5.0),
+    ("square", 90.0, 7.0),
+    ("trine", 120.0, 7.0),
+    ("opposition", 180.0, 8.0),
+)
+HOUSE_SYSTEM_CODE = {
+    "whole_sign": b"W",
+    "placidus": b"P",
+}
+TIMEZONE_FINDER = TimezoneFinder(in_memory=True)
 
 
 def sanity_check_ephemeris() -> None:
@@ -241,38 +255,30 @@ def geocode_place(city: str, state: Optional[str], country: str) -> Tuple[float,
 
 
 @lru_cache(maxsize=512)
-def lookup_timezone_name(lat: float, lon: float) -> str:
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m",
-        "timezone": "auto",
-        "forecast_days": 1,
-    }
-    try:
-        response = httpx.get(TIMEZONE_LOOKUP_URL, params=params, timeout=10.0)
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Timezone lookup service error: {exc}") from exc
-
-    payload = response.json()
-    tz_name = payload.get("timezone")
+def lookup_timezone_name(lat_rounded: float, lon_rounded: float) -> str:
+    tz_name = TIMEZONE_FINDER.timezone_at(lat=lat_rounded, lng=lon_rounded)
     if not tz_name:
         raise HTTPException(
             status_code=400,
-            detail="Could not determine timezone from location. Provide timezone_offset_hours.",
+            detail="Could not determine timezone from location. Please confirm City + State/Province + Country.",
         )
     return tz_name
 
 
-def resolve_timezone_offset_hours(lat: float, lon: float, birth_date: date, birth_time: time) -> Tuple[float, str]:
-    tz_name = lookup_timezone_name(round(lat, 4), round(lon, 4))
+def resolve_timezone_offset_hours(
+    lat: float,
+    lon: float,
+    birth_date: date,
+    birth_time: time,
+    tz_name: Optional[str] = None,
+) -> Tuple[float, str]:
+    resolved_tz_name = tz_name or lookup_timezone_name(round(lat, 4), round(lon, 4))
     try:
-        tzinfo = ZoneInfo(tz_name)
+        tzinfo = ZoneInfo(resolved_tz_name)
     except ZoneInfoNotFoundError as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"Resolved timezone '{tz_name}' is not supported. Provide timezone_offset_hours.",
+            detail=f"Resolved timezone '{resolved_tz_name}' is not supported.",
         ) from exc
 
     local_dt = datetime.combine(birth_date, birth_time).replace(tzinfo=tzinfo)
@@ -280,15 +286,198 @@ def resolve_timezone_offset_hours(lat: float, lon: float, birth_date: date, birt
     if offset is None:
         raise HTTPException(
             status_code=400,
-            detail="Could not compute timezone offset for birth datetime. Provide timezone_offset_hours.",
+            detail="Could not compute timezone offset for birth datetime.",
         )
-    return offset.total_seconds() / 3600.0, tz_name
+    return offset.total_seconds() / 3600.0, resolved_tz_name
+
+
+def normalize_cusps(cusps_raw: Tuple[float, ...]) -> List[float]:
+    cusps = [float(cusp) % 360.0 for cusp in cusps_raw]
+    if len(cusps) == 13 and abs(cusps[0]) < 1e-8:
+        cusps = cusps[1:13]
+    elif len(cusps) >= 12:
+        cusps = cusps[:12]
+    if len(cusps) != 12:
+        raise ValueError("House cusp calculation failed.")
+    return cusps
+
+
+def longitude_in_segment(value: float, start: float, end: float) -> bool:
+    if start <= end:
+        return start <= value < end
+    return value >= start or value < end
+
+
+def house_for_longitude(lon: float, cusps: List[float]) -> int:
+    value = lon % 360.0
+    for idx in range(12):
+        start = cusps[idx] % 360.0
+        end = cusps[(idx + 1) % 12] % 360.0
+        if longitude_in_segment(value, start, end):
+            return idx + 1
+    return 12
+
+
+def compute_major_aspects(longitudes: Dict[str, float]) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    bodies = [name for name in PLANETS.keys() if name in longitudes]
+
+    for body1, body2 in combinations(bodies, 2):
+        lon1 = longitudes[body1]
+        lon2 = longitudes[body2]
+        delta = abs(lon1 - lon2) % 360.0
+        delta = min(delta, 360.0 - delta)
+
+        best_match: Optional[Tuple[str, float, float]] = None
+        for aspect_name, aspect_angle, max_orb in ASPECT_SPECS:
+            orb = abs(delta - aspect_angle)
+            if orb <= max_orb and (best_match is None or orb < best_match[2]):
+                best_match = (aspect_name, aspect_angle, orb)
+
+        if best_match is not None:
+            aspect_name, aspect_angle, orb = best_match
+            results.append(
+                {
+                    "between": [body1, body2],
+                    "type": aspect_name,
+                    "angle": aspect_angle,
+                    "delta": round(delta, 3),
+                    "orb": round(orb, 3),
+                }
+            )
+
+    results.sort(key=lambda item: item["orb"])
+    return results
+
+
+def compute_natal_chart(
+    birth_date: date,
+    birth_time: Optional[time],
+    city: str,
+    state: Optional[str],
+    country: str,
+    zodiac: Literal["tropical", "sidereal"],
+    house_system: Literal["whole_sign", "placidus"],
+    location_input: str,
+    birth_lat: float,
+    birth_lon: float,
+    timezone_offset_hours: Optional[float],
+    location_resolved: str,
+) -> Dict[str, Any]:
+    timezone_name = None
+    timezone_source = "input" if timezone_offset_hours is not None else None
+
+    if birth_time is not None:
+        timezone_name = lookup_timezone_name(round(birth_lat, 4), round(birth_lon, 4))
+        if timezone_offset_hours is None:
+            timezone_offset_hours, timezone_name = resolve_timezone_offset_hours(
+                birth_lat, birth_lon, birth_date, birth_time, tz_name=timezone_name
+            )
+            timezone_source = "resolved"
+
+    jd = parse_datetime_to_jd(birth_date, birth_time, timezone_offset_hours)
+
+    swe.set_topo(birth_lon, birth_lat, 0)
+    flag = swe.FLG_SWIEPH | swe.FLG_SPEED
+    if zodiac == "sidereal":
+        flag |= swe.FLG_SIDEREAL
+
+    houses_included = birth_time is not None
+    house_cusps: Optional[List[float]] = None
+    angles: Optional[Dict[str, float]] = None
+    if houses_included:
+        house_code = HOUSE_SYSTEM_CODE[house_system]
+        cusps_raw, ascmc = swe.houses(jd, birth_lat, birth_lon, house_code)
+        house_cusps = normalize_cusps(tuple(cusps_raw))
+        asc = float(ascmc[0]) % 360.0 if len(ascmc) > 0 else 0.0
+        mc = float(ascmc[1]) % 360.0 if len(ascmc) > 1 else 0.0
+        angles = {
+            "asc": round(asc, 6),
+            "mc": round(mc, 6),
+        }
+
+    placements: List[Dict[str, Any]] = []
+    planet_longitudes: Dict[str, float] = {}
+    for name, pid in PLANETS.items():
+        planet_lon = calc_longitude(jd, pid, flag) % 360.0
+        sign, deg = lon_to_sign_deg(planet_lon)
+        placement: Dict[str, Any] = {
+            "body": name,
+            "longitude": round(planet_lon, 6),
+            "sign": sign,
+            "degree_in_sign": round(deg, 3),
+        }
+        if house_cusps is not None:
+            placement["house"] = house_for_longitude(planet_lon, house_cusps)
+        placements.append(placement)
+        planet_longitudes[name] = planet_lon
+
+    aspects = compute_major_aspects(planet_longitudes)
+
+    meta: Dict[str, Any] = {
+        "ephemeris": "Swiss Ephemeris via pyswisseph",
+        "ephemeris_path": str(EPHE_PATH),
+        "time_provided": birth_time is not None,
+        "houses_included": houses_included,
+        "house_system": house_system,
+        "zodiac": zodiac,
+        "location_input": location_input,
+        "location_resolved": location_resolved,
+        "timezone_offset_hours": timezone_offset_hours,
+        "timezone_name": timezone_name,
+        "timezone_source": timezone_source,
+    }
+    if house_cusps is not None and angles is not None:
+        meta["house_cusps"] = [round(cusp, 6) for cusp in house_cusps]
+        meta["angles"] = angles
+    if birth_time is None:
+        meta["limitations"] = "Birth time missing; houses and angles omitted."
+
+    return {
+        "meta": meta,
+        "placements": placements,
+        "aspects": aspects,
+    }
+
+
+@lru_cache(maxsize=512)
+def compute_natal_chart_cached(
+    birth_date: date,
+    birth_time: Optional[time],
+    city: str,
+    state: Optional[str],
+    country: str,
+    zodiac: Literal["tropical", "sidereal"],
+    house_system: Literal["whole_sign", "placidus"],
+) -> Dict[str, Any]:
+    location_input = ", ".join([part for part in [city, state, country] if part])
+    birth_lat, birth_lon, _display_name = geocode_place(city, state, country)
+    return compute_natal_chart(
+        birth_date=birth_date,
+        birth_time=birth_time,
+        city=city,
+        state=state,
+        country=country,
+        zodiac=zodiac,
+        house_system=house_system,
+        location_input=location_input,
+        birth_lat=birth_lat,
+        birth_lon=birth_lon,
+        timezone_offset_hours=None,
+        location_resolved=location_input,
+    )
 
 
 # --------- Routes ---------
 @app.get("/")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/status")
+def status() -> Dict[str, Any]:
+    ephemeris_loaded = bool(swe) and EPHE_PATH.exists() and any(EPHE_PATH.glob("*.se1"))
+    return {"status": "ok", "version": app.version, "ephemeris_loaded": ephemeris_loaded}
 
 
 @app.post("/natal")
@@ -304,81 +493,47 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
 
         p = req.person
 
-        place = build_place(p)
-        place = " ".join(place.strip().split())
-        if not place:
+        location_input = build_place(p)
+        location_input = " ".join(location_input.strip().split())
+        if not location_input:
             raise ValueError("place could not be built from city/state/country.")
 
         if (p.lat is None) != (p.lon is None):
             raise ValueError("Provide both lat and lon or neither.")
 
+        if p.lat is None and p.lon is None and p.timezone_offset_hours is None:
+            return copy.deepcopy(
+                compute_natal_chart_cached(
+                    birth_date=p.date,
+                    birth_time=p.birth_time,
+                    city=p.city,
+                    state=p.state,
+                    country=p.country,
+                    zodiac=req.zodiac,
+                    house_system=req.house_system,
+                )
+            )
+
         if p.lat is not None and p.lon is not None:
             birth_lat = p.lat
             birth_lon = p.lon
-            location_resolved = place
         else:
-            birth_lat, birth_lon, _location_display = geocode_place(p.city, p.state, p.country)
-            location_resolved = place
+            birth_lat, birth_lon, _display_name = geocode_place(p.city, p.state, p.country)
 
-        timezone_offset_hours = p.timezone_offset_hours
-        timezone_name = None
-        timezone_source = "input" if timezone_offset_hours is not None else None
-
-        if p.birth_time is not None and timezone_offset_hours is None:
-            timezone_offset_hours, timezone_name = resolve_timezone_offset_hours(
-                birth_lat, birth_lon, p.date, p.birth_time
-            )
-            timezone_source = "resolved"
-
-        jd = parse_datetime_to_jd(p.date, p.birth_time, timezone_offset_hours)
-
-        # Swiss Ephemeris settings
-        swe.set_topo(birth_lon, birth_lat, 0)
-        flag = swe.FLG_SWIEPH | swe.FLG_SPEED
-        if req.zodiac == "sidereal":
-            flag |= swe.FLG_SIDEREAL
-
-        placements: List[Dict[str, Any]] = []
-        for name, pid in PLANETS.items():
-            planet_lon = calc_longitude(jd, pid, flag)
-            sign, deg = lon_to_sign_deg(planet_lon)
-            placements.append(
-                {
-                    "body": name,
-                    "longitude": round(planet_lon, 6),
-                    "sign": sign,
-                    "degree_in_sign": round(deg, 3),
-                }
-            )
-
-        aspects: List[Dict[str, Any]] = []
-
-        # Time-known rule: no houses/angles without time
-        time_provided = p.birth_time is not None
-        house_note = None
-        if not time_provided:
-            house_note = "Birth time missing -> houses/angles omitted."
-        elif req.house_system == "placidus":
-            house_note = "Placidus requested; this build currently returns placements/aspects only."
-
-        return {
-            "meta": {
-                "ephemeris": "Swiss Ephemeris via pyswisseph",
-                "ephemeris_path": str(EPHE_PATH),
-                "time_provided": time_provided,
-                "houses_included": False,
-                "house_system": req.house_system,
-                "zodiac": req.zodiac,
-                "location_input": place,
-                "location_resolved": location_resolved,
-                "timezone_offset_hours": timezone_offset_hours,
-                "timezone_name": timezone_name,
-                "timezone_source": timezone_source,
-                "note": house_note,
-            },
-            "placements": placements,
-            "aspects": aspects,  # major aspects can be added in a future change
-        }
+        return compute_natal_chart(
+            birth_date=p.date,
+            birth_time=p.birth_time,
+            city=p.city,
+            state=p.state,
+            country=p.country,
+            zodiac=req.zodiac,
+            house_system=req.house_system,
+            location_input=location_input,
+            birth_lat=birth_lat,
+            birth_lon=birth_lon,
+            timezone_offset_hours=p.timezone_offset_hours,
+            location_resolved=location_input,
+        )
 
     except HTTPException:
         raise
