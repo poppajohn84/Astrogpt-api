@@ -12,7 +12,7 @@ try:
 except Exception:
     swe = None
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 app = FastAPI(title="AstroGPT API", version="1.0.0")
 
@@ -32,7 +32,11 @@ class BirthData(BaseModel):
     country: str = Field(..., description="Birth country")
 
     # Optional fields
-    birth_time: Optional[time] = None
+    birth_time: Optional[time] = Field(
+        default=None,
+        validation_alias=AliasChoices("birth_time", "time"),
+        description="Birth time (optional).",
+    )
     state: Optional[str] = None
     place: Optional[str] = None
 
@@ -78,11 +82,7 @@ SIGNS = [
     "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces",
 ]
 
-GEOCODE_URL = "https://nominatim.openstreetmap.org/search"
-GEOCODE_HEADERS = {
-    # IMPORTANT: Put a real contact if you ship this publicly.
-    "User-Agent": "AstroGPT/1.0 (contact: you@example.com)",
-}
+OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 TIMEZONE_LOOKUP_URL = "https://api.open-meteo.com/v1/forecast"
 
 
@@ -95,8 +95,6 @@ def sanity_check_ephemeris() -> None:
 
 
 def build_place(p: BirthData) -> str:
-    if p.place and p.place.strip():
-        return p.place.strip()
     parts = [p.city, p.state, p.country]
     return ", ".join([x.strip() for x in parts if x and x.strip()])
 
@@ -132,20 +130,104 @@ def lon_to_sign_deg(lon: float):
 
 
 @lru_cache(maxsize=512)
-def geocode_place(place: str) -> Tuple[float, float, str]:
-    params = {"q": place, "format": "json", "limit": 1, "addressdetails": 1}
+def geocode_place(city: str, state: Optional[str], country: str) -> Tuple[float, float, str]:
+    def normalize(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        return " ".join(
+            "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in value).split()
+        )
+
+    def normalize_country_code(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        letters = "".join(ch for ch in value.upper() if ch.isalpha())
+        return letters if len(letters) == 2 else None
+
+    def display_name_for(candidate: Dict[str, Any]) -> str:
+        parts = [candidate.get("name"), candidate.get("admin1"), candidate.get("country")]
+        cleaned = [str(part).strip() for part in parts if part and str(part).strip()]
+        return ", ".join(cleaned) if cleaned else city
+
+    city_norm = normalize(city)
+    state_norm = normalize(state)
+    country_norm = normalize(country)
+    country_code = normalize_country_code(country)
+
+    params = {
+        "name": city,
+        "count": 5,
+        "language": "en",
+        "format": "json",
+    }
     try:
-        response = httpx.get(GEOCODE_URL, params=params, headers=GEOCODE_HEADERS, timeout=10.0)
+        response = httpx.get(OPEN_METEO_GEOCODE_URL, params=params, timeout=10.0)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Geocoding service error: {exc}") from exc
+        raise HTTPException(
+            status_code=400,
+            detail="Could not resolve location. Please confirm City + State/Province + Country.",
+        ) from exc
 
-    results = response.json()
+    payload = response.json()
+    results = payload.get("results") or []
     if not results:
-        raise HTTPException(status_code=400, detail=f"Could not resolve place: {place}")
+        raise HTTPException(
+            status_code=400,
+            detail="Could not resolve location. Please confirm City + State/Province + Country.",
+        )
 
-    top = results[0]
-    return float(top["lat"]), float(top["lon"]), top.get("display_name", place)
+    def score(candidate: Dict[str, Any]) -> int:
+        points = 0
+
+        candidate_country_code = str(candidate.get("country_code", "")).upper()
+        candidate_country_name = normalize(candidate.get("country"))
+        candidate_admin1 = normalize(candidate.get("admin1"))
+        candidate_city = normalize(candidate.get("name"))
+
+        if country:
+            if country_code and candidate_country_code == country_code:
+                points += 3
+            elif (
+                country_norm
+                and candidate_country_name
+                and (
+                    candidate_country_name == country_norm
+                    or country_norm in candidate_country_name
+                    or candidate_country_name in country_norm
+                )
+            ):
+                points += 3
+
+        if state:
+            if (
+                state_norm
+                and candidate_admin1
+                and (
+                    candidate_admin1 == state_norm
+                    or state_norm in candidate_admin1
+                    or candidate_admin1 in state_norm
+                )
+            ):
+                points += 3
+
+        if city_norm and candidate_city == city_norm:
+            points += 1
+
+        return points
+
+    best = max(results, key=lambda cand: (score(cand), int(cand.get("population") or 0)))
+
+    try:
+        lat = float(best["latitude"])
+        lon = float(best["longitude"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not resolve location. Please confirm City + State/Province + Country.",
+        ) from exc
+
+    return lat, lon, display_name_for(best)
 
 
 @lru_cache(maxsize=512)
@@ -225,19 +307,20 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
             birth_lon = p.lon
             location_resolved = place
         else:
-            birth_lat, birth_lon, location_resolved = geocode_place(place)
+            birth_lat, birth_lon, _location_display = geocode_place(p.city, p.state, p.country)
+            location_resolved = place
 
         timezone_offset_hours = p.timezone_offset_hours
         timezone_name = None
         timezone_source = "input" if timezone_offset_hours is not None else None
 
-        if p.time is not None and timezone_offset_hours is None:
+        if p.birth_time is not None and timezone_offset_hours is None:
             timezone_offset_hours, timezone_name = resolve_timezone_offset_hours(
-                birth_lat, birth_lon, p.date, p.time
+                birth_lat, birth_lon, p.date, p.birth_time
             )
             timezone_source = "resolved"
 
-        jd = parse_datetime_to_jd(p.date, p.time, timezone_offset_hours)
+        jd = parse_datetime_to_jd(p.date, p.birth_time, timezone_offset_hours)
 
         # Swiss Ephemeris settings
         swe.set_topo(birth_lon, birth_lat, 0)
@@ -261,7 +344,7 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
         aspects: List[Dict[str, Any]] = []
 
         # Time-known rule: no houses/angles without time
-        time_provided = p.time is not None
+        time_provided = p.birth_time is not None
         house_note = None
         if not time_provided:
             house_note = "Birth time missing -> houses/angles omitted."
@@ -278,8 +361,6 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
                 "zodiac": req.zodiac,
                 "location_input": place,
                 "location_resolved": location_resolved,
-                "lat": birth_lat,
-                "lon": birth_lon,
                 "timezone_offset_hours": timezone_offset_hours,
                 "timezone_name": timezone_name,
                 "timezone_source": timezone_source,
@@ -298,4 +379,4 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
     except Exception as exc:
         print(f"Internal error in /natal: {exc}")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Internal error: {exc}") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
