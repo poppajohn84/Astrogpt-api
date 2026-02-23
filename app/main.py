@@ -129,6 +129,16 @@ def lon_to_sign_deg(lon: float):
     return SIGNS[sign_index], deg_in_sign
 
 
+def calc_longitude(jd: float, body: int, flag: Optional[int] = None) -> float:
+    if swe is None:
+        raise ValueError("Swiss Ephemeris not available")
+    if flag is None:
+        xx, _ = swe.calc_ut(jd, body)
+    else:
+        xx, _ = swe.calc_ut(jd, body, flag)
+    return xx[0]
+
+
 @lru_cache(maxsize=512)
 def geocode_place(city: str, state: Optional[str], country: str) -> Tuple[float, float, str]:
     def normalize(value: Optional[str]) -> str:
@@ -330,7 +340,7 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
 
         placements: List[Dict[str, Any]] = []
         for name, pid in PLANETS.items():
-            planet_lon, _, _, _ = swe.calc_ut(jd, pid, flag)[0]
+            planet_lon = calc_longitude(jd, pid, flag)
             sign, deg = lon_to_sign_deg(planet_lon)
             placements.append(
                 {
