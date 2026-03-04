@@ -12,8 +12,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from timezonefinder import TimezoneFinder
+
+# Absolute ephemeris path must resolve to <repo_root>/ephemeris.
+EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
+EPHE_FILE = EPHE_PATH / "seas_18.se1"
+
 try:
     import swisseph as swe
+    swe.set_ephe_path(str(EPHE_PATH))
 except Exception:
     swe = None
 from fastapi import FastAPI, HTTPException
@@ -22,13 +28,17 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator
 app = FastAPI(title="AstroGPT API", version="1.0.0")
 logger = logging.getLogger(__name__)
 
-# Absolute ephemeris path (Render-safe)
-EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
-logger.info("Swiss Ephemeris path resolved to: %s", EPHE_PATH)
-if not EPHE_PATH.exists():
-    logger.error("Swiss Ephemeris directory not found: %s", EPHE_PATH)
-if swe:
-    swe.set_ephe_path(str(EPHE_PATH))
+ephe_dir_exists = EPHE_PATH.exists()
+seas_18_exists = EPHE_FILE.exists()
+logger.info("Swiss Ephemeris EPHE_PATH=%s seas_18.se1_exists=%s", EPHE_PATH, seas_18_exists)
+print(f"[startup] EPHE_PATH={EPHE_PATH} seas_18.se1_exists={seas_18_exists}")
+if not ephe_dir_exists or not seas_18_exists:
+    raise RuntimeError(
+        "Swiss Ephemeris dataset missing: "
+        f"EPHE_PATH='{EPHE_PATH}', "
+        f"folder_exists={ephe_dir_exists}, "
+        f"seas_18.se1_exists={seas_18_exists}"
+    )
 
 
 # --------- Models ---------
