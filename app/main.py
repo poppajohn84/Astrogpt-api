@@ -1,4 +1,5 @@
 import copy
+import logging
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
@@ -19,9 +20,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 app = FastAPI(title="AstroGPT API", version="1.0.0")
+logger = logging.getLogger(__name__)
 
 # Absolute ephemeris path (Render-safe)
 EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
+logger.info("Swiss Ephemeris path resolved to: %s", EPHE_PATH)
+if not EPHE_PATH.exists():
+    logger.error("Swiss Ephemeris directory not found: %s", EPHE_PATH)
 if swe:
     swe.set_ephe_path(str(EPHE_PATH))
 
