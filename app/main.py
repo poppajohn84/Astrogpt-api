@@ -81,6 +81,41 @@ PLANETS = (
     else {}
 )
 
+EXTRA_BODIES = (
+    {
+        "North Node": swe.TRUE_NODE,
+        "Chiron": swe.CHIRON,
+        "Ceres": swe.CERES,
+        "Pallas": swe.PALLAS,
+        "Juno": swe.JUNO,
+        "Vesta": swe.VESTA,
+    }
+    if swe
+    else {}
+)
+
+BODIES = {**PLANETS, **EXTRA_BODIES}
+
+BODY_ORDER = [
+    "Sun",
+    "Moon",
+    "Mercury",
+    "Venus",
+    "Mars",
+    "Jupiter",
+    "Saturn",
+    "Uranus",
+    "Neptune",
+    "Pluto",
+    "North Node",
+    "South Node",
+    "Chiron",
+    "Ceres",
+    "Pallas",
+    "Juno",
+    "Vesta",
+]
+
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
     "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces",
@@ -403,7 +438,7 @@ def house_for_longitude(lon: float, cusps: List[float]) -> int:
 
 def compute_major_aspects(longitudes: Dict[str, float]) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
-    bodies = [name for name in PLANETS.keys() if name in longitudes]
+    bodies = list(longitudes.keys())
 
     for body1, body2 in combinations(bodies, 2):
         lon1 = longitudes[body1]
@@ -480,22 +515,34 @@ def compute_natal_chart(
         }
 
     placements: List[Dict[str, Any]] = []
-    planet_longitudes: Dict[str, float] = {}
-    for name, pid in PLANETS.items():
-        planet_lon = calc_longitude(jd, pid, flag) % 360.0
-        sign, deg = lon_to_sign_deg(planet_lon)
+    body_longitudes: Dict[str, float] = {}
+
+    def build_placement(name: str, longitude: float) -> Dict[str, Any]:
+        sign, deg = lon_to_sign_deg(longitude)
         placement: Dict[str, Any] = {
             "body": name,
-            "longitude": round(planet_lon, 6),
+            "longitude": round(longitude, 6),
             "sign": sign,
             "degree_in_sign": round(deg, 3),
         }
         if house_cusps is not None:
-            placement["house"] = house_for_longitude(planet_lon, house_cusps)
-        placements.append(placement)
-        planet_longitudes[name] = planet_lon
+            placement["house"] = house_for_longitude(longitude, house_cusps)
+        return placement
 
-    aspects = compute_major_aspects(planet_longitudes)
+    for name, body in BODIES.items():
+        longitude = calc_longitude(jd, body, flag) % 360.0
+        body_longitudes[name] = longitude
+        placements.append(build_placement(name, longitude))
+
+    if "North Node" in body_longitudes:
+        south_lon = (body_longitudes["North Node"] + 180.0) % 360.0
+        body_longitudes["South Node"] = south_lon
+        placements.append(build_placement("South Node", south_lon))
+
+    order_map = {body_name: idx for idx, body_name in enumerate(BODY_ORDER)}
+    placements.sort(key=lambda item: order_map.get(item["body"], len(BODY_ORDER)))
+
+    aspects = compute_major_aspects(body_longitudes)
 
     meta: Dict[str, Any] = {
         "ephemeris": "Swiss Ephemeris via pyswisseph",
