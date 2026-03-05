@@ -1,5 +1,4 @@
-import logging
-logging.basicConfig(level=logging.INFO)
+import copy
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
@@ -12,48 +11,23 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from timezonefinder import TimezoneFinder
-
-# Absolute ephemeris path fallback:
-# 1) <repo_root>/ephemeris
-# 2) <repo_root>/app/ephemeris
-EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
-if not EPHE_PATH.exists():
-    EPHE_PATH = Path(__file__).resolve().parent / "ephemeris"
-EPHE_FILE = EPHE_PATH / "seas_18.se1"
-
 try:
     import swisseph as swe
-    swe.set_ephe_path(str(EPHE_PATH))
 except Exception:
     swe = None
-from fastapi import FastAPI, HTTPException, Response
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from fastapi import FastAPI, HTTPException
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 app = FastAPI(title="AstroGPT API", version="1.0.0")
-logger = logging.getLogger(__name__)
 
-ephe_dir_exists = EPHE_PATH.exists()
-seas_18_exists = EPHE_FILE.exists()
-logger.info(
-    "Swiss Ephemeris EPHE_PATH=%s EPHE_FILE=%s seas_18.se1_exists=%s",
-    EPHE_PATH,
-    EPHE_FILE,
-    seas_18_exists,
-)
-print(f"[startup] EPHE_PATH={EPHE_PATH} EPHE_FILE={EPHE_FILE} seas_18.se1_exists={seas_18_exists}")
-if not ephe_dir_exists or not seas_18_exists:
-    raise RuntimeError(
-        "Swiss Ephemeris dataset missing: "
-        f"EPHE_PATH='{EPHE_PATH}', "
-        f"folder_exists={ephe_dir_exists}, "
-        f"seas_18.se1_exists={seas_18_exists}"
-    )
+# Absolute ephemeris path (Render-safe)
+EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
+if swe:
+    swe.set_ephe_path(str(EPHE_PATH))
 
 
 # --------- Models ---------
 class BirthData(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
     name: Optional[str] = None
 
     # Required by design (so GPT will ask for them)
@@ -68,8 +42,13 @@ class BirthData(BaseModel):
         description="Birth time (optional).",
     )
     state: Optional[str] = None
+    place: Optional[str] = None
 
-    @field_validator("city", "state", "country")
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    timezone_offset_hours: Optional[float] = None
+
+    @field_validator("city", "state", "country", "place")
     @classmethod
     def normalize_optional_strings(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -101,41 +80,6 @@ PLANETS = (
     if swe
     else {}
 )
-
-EXTRA_BODIES = (
-    {
-        "North Node": swe.TRUE_NODE,
-        "Chiron": swe.CHIRON,
-        "Ceres": swe.CERES,
-        "Pallas": swe.PALLAS,
-        "Juno": swe.JUNO,
-        "Vesta": swe.VESTA,
-    }
-    if swe
-    else {}
-)
-
-BODIES = {**PLANETS, **EXTRA_BODIES}
-
-BODY_ORDER = [
-    "Sun",
-    "Moon",
-    "Mercury",
-    "Venus",
-    "Mars",
-    "Jupiter",
-    "Saturn",
-    "Uranus",
-    "Neptune",
-    "Pluto",
-    "North Node",
-    "South Node",
-    "Chiron",
-    "Ceres",
-    "Pallas",
-    "Juno",
-    "Vesta",
-]
 
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -459,7 +403,7 @@ def house_for_longitude(lon: float, cusps: List[float]) -> int:
 
 def compute_major_aspects(longitudes: Dict[str, float]) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
-    bodies = list(longitudes.keys())
+    bodies = [name for name in PLANETS.keys() if name in longitudes]
 
     for body1, body2 in combinations(bodies, 2):
         lon1 = longitudes[body1]
@@ -536,34 +480,22 @@ def compute_natal_chart(
         }
 
     placements: List[Dict[str, Any]] = []
-    body_longitudes: Dict[str, float] = {}
-
-    def build_placement(name: str, longitude: float) -> Dict[str, Any]:
-        sign, deg = lon_to_sign_deg(longitude)
+    planet_longitudes: Dict[str, float] = {}
+    for name, pid in PLANETS.items():
+        planet_lon = calc_longitude(jd, pid, flag) % 360.0
+        sign, deg = lon_to_sign_deg(planet_lon)
         placement: Dict[str, Any] = {
             "body": name,
-            "longitude": round(longitude, 6),
+            "longitude": round(planet_lon, 6),
             "sign": sign,
             "degree_in_sign": round(deg, 3),
         }
         if house_cusps is not None:
-            placement["house"] = house_for_longitude(longitude, house_cusps)
-        return placement
+            placement["house"] = house_for_longitude(planet_lon, house_cusps)
+        placements.append(placement)
+        planet_longitudes[name] = planet_lon
 
-    for name, body in BODIES.items():
-        longitude = calc_longitude(jd, body, flag) % 360.0
-        body_longitudes[name] = longitude
-        placements.append(build_placement(name, longitude))
-
-    if "North Node" in body_longitudes:
-        south_lon = (body_longitudes["North Node"] + 180.0) % 360.0
-        body_longitudes["South Node"] = south_lon
-        placements.append(build_placement("South Node", south_lon))
-
-    order_map = {body_name: idx for idx, body_name in enumerate(BODY_ORDER)}
-    placements.sort(key=lambda item: order_map.get(item["body"], len(BODY_ORDER)))
-
-    aspects = compute_major_aspects(body_longitudes)
+    aspects = compute_major_aspects(planet_longitudes)
 
     meta: Dict[str, Any] = {
         "ephemeris": "Swiss Ephemeris via pyswisseph",
@@ -622,30 +554,13 @@ def compute_natal_chart_cached(
 # --------- Routes ---------
 @app.get("/")
 def health() -> Dict[str, str]:
-    return {"status": "ok", "version": "ephepath-2026-03-04a"}
-
-@app.head("/")
-def health_head() -> Response:
-    return Response(status_code=200)
+    return {"status": "ok"}
 
 
 @app.get("/status")
 def status() -> Dict[str, Any]:
     ephemeris_loaded = bool(swe) and EPHE_PATH.exists() and any(EPHE_PATH.glob("*.se1"))
     return {"status": "ok", "version": app.version, "ephemeris_loaded": ephemeris_loaded}
-
-
-@app.get("/debug/ephemeris")
-def debug_ephemeris() -> Dict[str, Any]:
-    ephe_path_exists = EPHE_PATH.exists()
-    se1_files = sorted(path.name for path in EPHE_PATH.glob("*.se1")) if ephe_path_exists else []
-    return {
-        "ephe_path": str(EPHE_PATH),
-        "ephe_path_exists": ephe_path_exists,
-        "seas_18_exists": EPHE_FILE.exists(),
-        "se1_files": se1_files,
-        "swe_loaded": bool(swe),
-    }
 
 
 @app.post("/natal")
@@ -666,7 +581,28 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
         if not location_input:
             raise ValueError("place could not be built from city/state/country.")
 
-        birth_lat, birth_lon, location_resolved = geocode_place(p.city, p.state, p.country)
+        if (p.lat is None) != (p.lon is None):
+            raise ValueError("Provide both lat and lon or neither.")
+
+        if p.lat is None and p.lon is None and p.timezone_offset_hours is None:
+            return copy.deepcopy(
+                compute_natal_chart_cached(
+                    birth_date=p.date,
+                    birth_time=p.birth_time,
+                    city=p.city,
+                    state=p.state,
+                    country=p.country,
+                    zodiac=req.zodiac,
+                    house_system=req.house_system,
+                )
+            )
+
+        if p.lat is not None and p.lon is not None:
+            birth_lat = p.lat
+            birth_lon = p.lon
+            location_resolved = location_input
+        else:
+            birth_lat, birth_lon, location_resolved = geocode_place(p.city, p.state, p.country)
 
         return compute_natal_chart(
             birth_date=p.date,
@@ -679,7 +615,7 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
             location_input=location_input,
             birth_lat=birth_lat,
             birth_lon=birth_lon,
-            timezone_offset_hours=None,
+            timezone_offset_hours=p.timezone_offset_hours,
             location_resolved=location_resolved,
         )
 
