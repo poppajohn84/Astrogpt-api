@@ -81,6 +81,14 @@ PLANETS = (
     else {}
 )
 
+NODE_BODIES = (
+    {
+        "North Node": swe.TRUE_NODE,
+    }
+    if swe
+    else {}
+)
+
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
     "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces",
@@ -481,6 +489,7 @@ def compute_natal_chart(
 
     placements: List[Dict[str, Any]] = []
     planet_longitudes: Dict[str, float] = {}
+    nodes_included = False
     for name, pid in PLANETS.items():
         planet_lon = calc_longitude(jd, pid, flag) % 360.0
         sign, deg = lon_to_sign_deg(planet_lon)
@@ -494,6 +503,22 @@ def compute_natal_chart(
             placement["house"] = house_for_longitude(planet_lon, house_cusps)
         placements.append(placement)
         planet_longitudes[name] = planet_lon
+
+    if "North Node" in NODE_BODIES:
+        north_lon = calc_longitude(jd, NODE_BODIES["North Node"], flag) % 360.0
+        south_lon = (north_lon + 180.0) % 360.0
+        for node_name, node_lon in [("North Node", north_lon), ("South Node", south_lon)]:
+            sign, deg = lon_to_sign_deg(node_lon)
+            node_placement: Dict[str, Any] = {
+                "body": node_name,
+                "longitude": round(node_lon, 6),
+                "sign": sign,
+                "degree_in_sign": round(deg, 3),
+            }
+            if house_cusps is not None:
+                node_placement["house"] = house_for_longitude(node_lon, house_cusps)
+            placements.append(node_placement)
+        nodes_included = True
 
     aspects = compute_major_aspects(planet_longitudes)
 
@@ -513,6 +538,8 @@ def compute_natal_chart(
     if house_cusps is not None and angles is not None:
         meta["house_cusps"] = [round(cusp, 6) for cusp in house_cusps]
         meta["angles"] = angles
+    if nodes_included:
+        meta["nodes_included"] = True
     if birth_time is None:
         meta["limitations"] = "Birth time missing; houses and angles omitted."
 
