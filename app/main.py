@@ -26,7 +26,7 @@ try:
     swe.set_ephe_path(str(EPHE_PATH))
 except Exception:
     swe = None
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 app = FastAPI(title="AstroGPT API", version="1.0.0")
@@ -623,6 +623,10 @@ def compute_natal_chart_cached(
 @app.get("/")
 def health() -> Dict[str, str]:
     return {"status": "ok", "version": "ephepath-2026-03-04a"}
+
+@app.head("/")
+def health_head() -> Response:
+    return Response(status_code=200)
 
 
 @app.get("/status")
