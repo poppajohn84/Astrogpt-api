@@ -622,13 +622,26 @@ def compute_natal_chart_cached(
 # --------- Routes ---------
 @app.get("/")
 def health() -> Dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": "ephepath-2026-03-04a"}
 
 
 @app.get("/status")
 def status() -> Dict[str, Any]:
     ephemeris_loaded = bool(swe) and EPHE_PATH.exists() and any(EPHE_PATH.glob("*.se1"))
     return {"status": "ok", "version": app.version, "ephemeris_loaded": ephemeris_loaded}
+
+
+@app.get("/debug/ephemeris")
+def debug_ephemeris() -> Dict[str, Any]:
+    ephe_path_exists = EPHE_PATH.exists()
+    se1_files = sorted(path.name for path in EPHE_PATH.glob("*.se1")) if ephe_path_exists else []
+    return {
+        "ephe_path": str(EPHE_PATH),
+        "ephe_path_exists": ephe_path_exists,
+        "seas_18_exists": EPHE_FILE.exists(),
+        "se1_files": se1_files,
+        "swe_loaded": bool(swe),
+    }
 
 
 @app.post("/natal")
