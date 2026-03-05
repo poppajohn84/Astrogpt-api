@@ -1,5 +1,5 @@
-import copy
 import logging
+logging.basicConfig(level=logging.INFO)
 from functools import lru_cache
 from itertools import combinations
 from pathlib import Path
@@ -13,8 +13,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from timezonefinder import TimezoneFinder
 
-# Absolute ephemeris path must resolve to <repo_root>/ephemeris.
+# Absolute ephemeris path fallback:
+# 1) <repo_root>/ephemeris
+# 2) <repo_root>/app/ephemeris
 EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
+if not EPHE_PATH.exists():
+    EPHE_PATH = Path(__file__).resolve().parent / "ephemeris"
 EPHE_FILE = EPHE_PATH / "seas_18.se1"
 
 try:
@@ -23,15 +27,20 @@ try:
 except Exception:
     swe = None
 from fastapi import FastAPI, HTTPException
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 app = FastAPI(title="AstroGPT API", version="1.0.0")
 logger = logging.getLogger(__name__)
 
 ephe_dir_exists = EPHE_PATH.exists()
 seas_18_exists = EPHE_FILE.exists()
-logger.info("Swiss Ephemeris EPHE_PATH=%s seas_18.se1_exists=%s", EPHE_PATH, seas_18_exists)
-print(f"[startup] EPHE_PATH={EPHE_PATH} seas_18.se1_exists={seas_18_exists}")
+logger.info(
+    "Swiss Ephemeris EPHE_PATH=%s EPHE_FILE=%s seas_18.se1_exists=%s",
+    EPHE_PATH,
+    EPHE_FILE,
+    seas_18_exists,
+)
+print(f"[startup] EPHE_PATH={EPHE_PATH} EPHE_FILE={EPHE_FILE} seas_18.se1_exists={seas_18_exists}")
 if not ephe_dir_exists or not seas_18_exists:
     raise RuntimeError(
         "Swiss Ephemeris dataset missing: "
@@ -43,6 +52,8 @@ if not ephe_dir_exists or not seas_18_exists:
 
 # --------- Models ---------
 class BirthData(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: Optional[str] = None
 
     # Required by design (so GPT will ask for them)
@@ -57,13 +68,8 @@ class BirthData(BaseModel):
         description="Birth time (optional).",
     )
     state: Optional[str] = None
-    place: Optional[str] = None
 
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-    timezone_offset_hours: Optional[float] = None
-
-    @field_validator("city", "state", "country", "place")
+    @field_validator("city", "state", "country")
     @classmethod
     def normalize_optional_strings(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -643,28 +649,7 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
         if not location_input:
             raise ValueError("place could not be built from city/state/country.")
 
-        if (p.lat is None) != (p.lon is None):
-            raise ValueError("Provide both lat and lon or neither.")
-
-        if p.lat is None and p.lon is None and p.timezone_offset_hours is None:
-            return copy.deepcopy(
-                compute_natal_chart_cached(
-                    birth_date=p.date,
-                    birth_time=p.birth_time,
-                    city=p.city,
-                    state=p.state,
-                    country=p.country,
-                    zodiac=req.zodiac,
-                    house_system=req.house_system,
-                )
-            )
-
-        if p.lat is not None and p.lon is not None:
-            birth_lat = p.lat
-            birth_lon = p.lon
-            location_resolved = location_input
-        else:
-            birth_lat, birth_lon, location_resolved = geocode_place(p.city, p.state, p.country)
+        birth_lat, birth_lon, location_resolved = geocode_place(p.city, p.state, p.country)
 
         return compute_natal_chart(
             birth_date=p.date,
@@ -677,7 +662,7 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
             location_input=location_input,
             birth_lat=birth_lat,
             birth_lon=birth_lon,
-            timezone_offset_hours=p.timezone_offset_hours,
+            timezone_offset_hours=None,
             location_resolved=location_resolved,
         )
 
