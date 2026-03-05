@@ -11,19 +11,28 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from timezonefinder import TimezoneFinder
+
+EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
+EPHE_FILE = EPHE_PATH / "seas_18.se1"
+
 try:
     import swisseph as swe
+    swe.set_ephe_path(str(EPHE_PATH))
+    print(f"[startup] EPHE_PATH={EPHE_PATH} seas_18_exists={EPHE_FILE.exists()}")
+    if not EPHE_FILE.exists():
+        raise RuntimeError(
+            "Swiss Ephemeris dataset missing: "
+            f"EPHE_PATH='{EPHE_PATH}', "
+            f"folder_exists={EPHE_PATH.exists()}, "
+            f"ephe_file_exists={EPHE_FILE.exists()}"
+        )
 except Exception:
     swe = None
+
 from fastapi import FastAPI, HTTPException
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 app = FastAPI(title="AstroGPT API", version="1.0.0")
-
-# Absolute ephemeris path (Render-safe)
-EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
-if swe:
-    swe.set_ephe_path(str(EPHE_PATH))
 
 
 # --------- Models ---------
@@ -88,6 +97,26 @@ NODE_BODIES = (
     if swe
     else {}
 )
+
+if swe:
+    _ASTEROID_CONSTANTS = {
+        "Chiron": "CHIRON",
+        "Ceres": "CERES",
+        "Pallas": "PALLAS",
+        "Juno": "JUNO",
+        "Vesta": "VESTA",
+    }
+    _missing_asteroid_constants = [
+        const_name for const_name in _ASTEROID_CONSTANTS.values() if not hasattr(swe, const_name)
+    ]
+    if _missing_asteroid_constants:
+        raise RuntimeError(
+            "Swiss Ephemeris missing required asteroid constants: "
+            + ", ".join(_missing_asteroid_constants)
+        )
+    ASTEROIDS = {name: getattr(swe, const_name) for name, const_name in _ASTEROID_CONSTANTS.items()}
+else:
+    ASTEROIDS = {}
 
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -168,6 +197,7 @@ def lon_to_sign_deg(lon: float):
 def calc_longitude(jd: float, body: int, flag: Optional[int] = None) -> float:
     if swe is None:
         raise ValueError("Swiss Ephemeris not available")
+    swe.set_ephe_path(str(EPHE_PATH))
     if flag is None:
         xx, _ = swe.calc_ut(jd, body)
     else:
@@ -498,6 +528,7 @@ def compute_natal_chart(
     placements: List[Dict[str, Any]] = []
     planet_longitudes: Dict[str, float] = {}
     nodes_included = False
+    asteroids_included: List[str] = []
     north_node_lon: Optional[float] = None
     south_node_lon: Optional[float] = None
     for name, pid in PLANETS.items():
@@ -536,6 +567,23 @@ def compute_natal_chart(
             placements.append(node_placement)
         nodes_included = True
 
+    for asteroid_name, asteroid_id in ASTEROIDS.items():
+        asteroid_lon = calc_longitude(jd, asteroid_id, flag) % 360.0
+        sign, deg = lon_to_sign_deg(asteroid_lon)
+        asteroid_placement: Dict[str, Any] = {
+            "body": asteroid_name,
+            "longitude": round(asteroid_lon, 6),
+            "sign": sign,
+            "degree_in_sign": round(deg, 3),
+        }
+        if house_cusps is not None:
+            if house_system == "whole_sign" and asc_lon is not None:
+                asteroid_placement["house"] = whole_sign_house_for_longitude(asteroid_lon, asc_lon)
+            else:
+                asteroid_placement["house"] = house_for_longitude(asteroid_lon, house_cusps)
+        placements.append(asteroid_placement)
+        asteroids_included.append(asteroid_name)
+
     if north_node_lon is not None and south_node_lon is not None:
         planet_longitudes["North Node"] = north_node_lon
         planet_longitudes["South Node"] = south_node_lon
@@ -560,6 +608,8 @@ def compute_natal_chart(
         meta["angles"] = angles
     if nodes_included:
         meta["nodes_included"] = True
+    if asteroids_included:
+        meta["asteroids_included"] = asteroids_included
     if birth_time is None:
         meta["limitations"] = "Birth time missing; houses and angles omitted."
 
