@@ -114,9 +114,9 @@ if swe:
             "Swiss Ephemeris missing required asteroid constants: "
             + ", ".join(_missing_asteroid_constants)
         )
-    ASTEROIDS = {name: getattr(swe, const_name) for name, const_name in _ASTEROID_CONSTANTS.items()}
+    ASTEROID_BODIES = {name: getattr(swe, const_name) for name, const_name in _ASTEROID_CONSTANTS.items()}
 else:
-    ASTEROIDS = {}
+    ASTEROID_BODIES = {}
 
 SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
@@ -567,7 +567,7 @@ def compute_natal_chart(
             placements.append(node_placement)
         nodes_included = True
 
-    for asteroid_name, asteroid_id in ASTEROIDS.items():
+    for asteroid_name, asteroid_id in ASTEROID_BODIES.items():
         asteroid_lon = calc_longitude(jd, asteroid_id, flag) % 360.0
         sign, deg = lon_to_sign_deg(asteroid_lon)
         asteroid_placement: Dict[str, Any] = {
@@ -615,9 +615,30 @@ def compute_natal_chart(
     if birth_time is None:
         meta["limitations"] = "Birth time missing; houses and angles omitted."
 
+    planet_bodies = {
+        "Sun", "Moon", "Mercury", "Venus", "Mars",
+        "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
+    }
+    point_bodies = {"North Node", "South Node"}
+    asteroid_bodies = {"Chiron", "Ceres", "Pallas", "Juno", "Vesta"}
+    grouped_placements: Dict[str, List[Dict[str, Any]]] = {
+        "planets": [],
+        "points": [],
+        "asteroids": [],
+    }
+    for placement in placements:
+        body = placement.get("body")
+        if body in planet_bodies:
+            grouped_placements["planets"].append(placement)
+        elif body in point_bodies:
+            grouped_placements["points"].append(placement)
+        elif body in asteroid_bodies:
+            grouped_placements["asteroids"].append(placement)
+
     return {
         "meta": meta,
         "placements": placements,
+        "grouped_placements": grouped_placements,
         "aspects": aspects,
     }
 
