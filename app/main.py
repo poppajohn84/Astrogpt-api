@@ -447,7 +447,7 @@ def whole_sign_house_for_longitude(planet_lon: float, asc_lon: float) -> int:
 
 def compute_major_aspects(longitudes: Dict[str, float]) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
-    bodies = [name for name in PLANETS.keys() if name in longitudes]
+    bodies = list(longitudes.keys())
 
     for body1, body2 in combinations(bodies, 2):
         lon1 = longitudes[body1]
@@ -582,6 +582,7 @@ def compute_natal_chart(
             else:
                 asteroid_placement["house"] = house_for_longitude(asteroid_lon, house_cusps)
         placements.append(asteroid_placement)
+        planet_longitudes[asteroid_name] = asteroid_lon
         asteroids_included.append(asteroid_name)
 
     if north_node_lon is not None and south_node_lon is not None:
@@ -610,6 +611,7 @@ def compute_natal_chart(
         meta["nodes_included"] = True
     if asteroids_included:
         meta["asteroids_included"] = asteroids_included
+        meta["asteroid_aspects_included"] = True
     if birth_time is None:
         meta["limitations"] = "Birth time missing; houses and angles omitted."
 
