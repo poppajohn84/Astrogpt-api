@@ -72,6 +72,13 @@ class NatalRequest(BaseModel):
     house_system: Literal["whole_sign", "placidus"] = "whole_sign"
 
 
+class CompositeRequest(BaseModel):
+    person_a: BirthData
+    person_b: BirthData
+    zodiac: Literal["tropical", "sidereal"] = "tropical"
+    house_system: Literal["whole_sign", "placidus"] = "whole_sign"
+
+
 # --------- Helpers ---------
 PLANETS = (
     {
@@ -203,6 +210,21 @@ def calc_longitude(jd: float, body: int, flag: Optional[int] = None) -> float:
     else:
         xx, _ = swe.calc_ut(jd, body, flag)
     return xx[0]
+
+
+def midpoint_longitude(lon_a: float, lon_b: float) -> float:
+    lon_a = lon_a % 360.0
+    lon_b = lon_b % 360.0
+    delta = ((lon_b - lon_a + 540.0) % 360.0) - 180.0
+    return (lon_a + (delta / 2.0)) % 360.0
+
+
+def placements_to_longitude_map(placements: List[Dict[str, Any]]) -> Dict[str, float]:
+    return {
+        placement["body"]: float(placement["longitude"])
+        for placement in placements
+        if "body" in placement and "longitude" in placement
+    }
 
 
 def _normalize_location_text(value: Optional[str]) -> str:
@@ -671,6 +693,92 @@ def compute_natal_chart_cached(
     )
 
 
+def compute_midpoint_composite_chart(
+    person_a: BirthData,
+    person_b: BirthData,
+    zodiac: Literal["tropical", "sidereal"],
+    house_system: Literal["whole_sign", "placidus"],
+) -> Dict[str, Any]:
+    def natal_for_person(person: BirthData) -> Dict[str, Any]:
+        location_input = build_place(person)
+        location_input = " ".join(location_input.strip().split())
+        if not location_input:
+            raise ValueError("place could not be built from city/state/country.")
+
+        if (person.lat is None) != (person.lon is None):
+            raise ValueError("Provide both lat and lon or neither.")
+
+        if person.lat is None and person.lon is None:
+            birth_lat, birth_lon, location_resolved = geocode_place(
+                person.city, person.state, person.country
+            )
+        else:
+            birth_lat = person.lat
+            birth_lon = person.lon
+            if birth_lat is None or birth_lon is None:
+                raise ValueError("Provide both lat and lon or neither.")
+            location_resolved = location_input
+
+        return compute_natal_chart(
+            birth_date=person.date,
+            birth_time=person.birth_time,
+            city=person.city,
+            state=person.state,
+            country=person.country,
+            zodiac=zodiac,
+            house_system=house_system,
+            location_input=location_input,
+            birth_lat=birth_lat,
+            birth_lon=birth_lon,
+            timezone_offset_hours=person.timezone_offset_hours,
+            location_resolved=location_resolved,
+        )
+
+    chart_a = natal_for_person(person_a)
+    chart_b = natal_for_person(person_b)
+
+    longitudes_a = placements_to_longitude_map(chart_a["placements"])
+    longitudes_b = placements_to_longitude_map(chart_b["placements"])
+
+    placements: List[Dict[str, Any]] = []
+    composite_longitudes: Dict[str, float] = {}
+    body_order = [placement["body"] for placement in chart_a["placements"]]
+    shared_bodies = [body for body in body_order if body in longitudes_b]
+
+    for body in shared_bodies:
+        composite_lon = midpoint_longitude(longitudes_a[body], longitudes_b[body])
+        sign, deg = lon_to_sign_deg(composite_lon)
+        placements.append(
+            {
+                "body": body,
+                "longitude": round(composite_lon, 6),
+                "sign": sign,
+                "degree_in_sign": round(deg, 3),
+            }
+        )
+        composite_longitudes[body] = composite_lon
+
+    aspects = compute_major_aspects(composite_longitudes)
+
+    houses_included = False
+    meta: Dict[str, Any] = {
+        "chart_type": "midpoint_composite",
+        "zodiac": zodiac,
+        "house_system": house_system,
+        "time_provided_a": person_a.birth_time is not None,
+        "time_provided_b": person_b.birth_time is not None,
+        "houses_included": houses_included,
+    }
+    if not houses_included:
+        meta["note"] = "Composite chart uses midpoint method; houses and angles omitted."
+
+    return {
+        "meta": meta,
+        "placements": placements,
+        "aspects": aspects,
+    }
+
+
 # --------- Routes ---------
 @app.get("/")
 def health() -> Dict[str, str]:
@@ -747,5 +855,35 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         print(f"Internal error in /natal: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/composite")
+def composite(req: CompositeRequest) -> Dict[str, Any]:
+    try:
+        if swe is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Swiss Ephemeris not available"
+            )
+
+        sanity_check_ephemeris()
+
+        return compute_midpoint_composite_chart(
+            person_a=req.person_a,
+            person_b=req.person_b,
+            zodiac=req.zodiac,
+            house_system=req.house_system,
+        )
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        print(f"Error in /composite: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"Internal error in /composite: {exc}")
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
