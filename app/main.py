@@ -10,6 +10,17 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+from app import models
+from app.db import Base, engine, get_db
+from app.schemas import (
+    BirthProfileCreate,
+    BirthProfileListItem,
+    BirthProfileResponse,
+    normalize_profile_name,
+)
+from fastapi import Depends, FastAPI, HTTPException, status
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 from timezonefinder import TimezoneFinder
 
 EPHE_PATH = Path(__file__).resolve().parent.parent / "ephemeris"
@@ -29,10 +40,14 @@ try:
 except Exception:
     swe = None
 
-from fastapi import FastAPI, HTTPException
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 app = FastAPI(title="AstroGPT API", version="1.0.0")
+
+
+@app.on_event("startup")
+def create_db_tables() -> None:
+    Base.metadata.create_all(bind=engine)
 
 
 # --------- Models ---------
@@ -779,6 +794,21 @@ def compute_midpoint_composite_chart(
     }
 
 
+def get_birth_profile_or_404(db: Session, profile_name: str) -> models.BirthProfile:
+    try:
+        normalized_name = normalize_profile_name(profile_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Profile not found") from exc
+    profile = (
+        db.query(models.BirthProfile)
+        .filter(models.BirthProfile.profile_name == normalized_name)
+        .first()
+    )
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return profile
+
+
 # --------- Routes ---------
 @app.get("/")
 def health() -> Dict[str, str]:
@@ -786,9 +816,56 @@ def health() -> Dict[str, str]:
 
 
 @app.get("/status")
-def status() -> Dict[str, Any]:
+def get_status() -> Dict[str, Any]:
     ephemeris_loaded = bool(swe) and EPHE_PATH.exists() and any(EPHE_PATH.glob("*.se1"))
     return {"status": "ok", "version": app.version, "ephemeris_loaded": ephemeris_loaded}
+
+
+@app.post("/profiles", response_model=BirthProfileResponse, status_code=status.HTTP_201_CREATED)
+def create_profile(
+    payload: BirthProfileCreate,
+    db: Session = Depends(get_db),
+) -> models.BirthProfile:
+    existing_profile = (
+        db.query(models.BirthProfile)
+        .filter(models.BirthProfile.profile_name == payload.profile_name)
+        .first()
+    )
+    if existing_profile is not None:
+        raise HTTPException(status_code=409, detail="Profile already exists")
+
+    profile = models.BirthProfile(**payload.model_dump())
+    db.add(profile)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Profile already exists") from exc
+    db.refresh(profile)
+    return profile
+
+
+@app.get("/profiles", response_model=List[BirthProfileListItem])
+def list_profiles(db: Session = Depends(get_db)) -> List[models.BirthProfile]:
+    return (
+        db.query(models.BirthProfile)
+        .order_by(models.BirthProfile.profile_name.asc())
+        .all()
+    )
+
+
+@app.get("/profiles/{profile_name}", response_model=BirthProfileResponse)
+def get_profile(profile_name: str, db: Session = Depends(get_db)) -> models.BirthProfile:
+    return get_birth_profile_or_404(db, profile_name)
+
+
+@app.delete("/profiles/{profile_name}")
+def delete_profile(profile_name: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    profile = get_birth_profile_or_404(db, profile_name)
+    normalized_name = profile.profile_name
+    db.delete(profile)
+    db.commit()
+    return {"deleted": True, "profile_name": normalized_name}
 
 
 @app.post("/natal")

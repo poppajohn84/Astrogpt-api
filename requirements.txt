@@ -4,3 +4,4 @@ httpx
 uvicorn
 timezonefinder==6.5.0
 tzdata
+sqlalchemy>=2,<3
