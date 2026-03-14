@@ -87,6 +87,14 @@ class NatalRequest(BaseModel):
     house_system: Literal["whole_sign", "placidus"] = "whole_sign"
 
 
+class TransitRequest(BaseModel):
+    person: BirthData
+    transit_date: Optional[date] = None
+    transit_time: Optional[time] = None
+    transit_timezone_offset_hours: Optional[float] = None
+    zodiac: Literal["tropical", "sidereal"] = "tropical"
+
+
 class CompositeRequest(BaseModel):
     person_a: BirthData
     person_b: BirthData
@@ -144,6 +152,71 @@ SIGNS = [
     "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
     "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces",
 ]
+SIGN_TO_ELEMENT = {
+    "Aries": "Fire",
+    "Leo": "Fire",
+    "Sagittarius": "Fire",
+    "Taurus": "Earth",
+    "Virgo": "Earth",
+    "Capricorn": "Earth",
+    "Gemini": "Air",
+    "Libra": "Air",
+    "Aquarius": "Air",
+    "Cancer": "Water",
+    "Scorpio": "Water",
+    "Pisces": "Water",
+}
+SIGN_TO_MODALITY = {
+    "Aries": "Cardinal",
+    "Cancer": "Cardinal",
+    "Libra": "Cardinal",
+    "Capricorn": "Cardinal",
+    "Taurus": "Fixed",
+    "Leo": "Fixed",
+    "Scorpio": "Fixed",
+    "Aquarius": "Fixed",
+    "Gemini": "Mutable",
+    "Virgo": "Mutable",
+    "Sagittarius": "Mutable",
+    "Pisces": "Mutable",
+}
+DOMINANCE_BODIES = {
+    "Sun", "Moon", "Mercury", "Venus", "Mars",
+    "Jupiter", "Saturn", "Uranus", "Neptune", "Pluto",
+}
+TRADITIONAL_SIGN_RULERS = {
+    "Aries": "Mars",
+    "Taurus": "Venus",
+    "Gemini": "Mercury",
+    "Cancer": "Moon",
+    "Leo": "Sun",
+    "Virgo": "Mercury",
+    "Libra": "Venus",
+    "Scorpio": "Mars",
+    "Sagittarius": "Jupiter",
+    "Capricorn": "Saturn",
+    "Aquarius": "Saturn",
+    "Pisces": "Jupiter",
+}
+PLANETARY_STRENGTH_BASE = {
+    "Sun": 5,
+    "Moon": 5,
+    "Mercury": 3,
+    "Venus": 3,
+    "Mars": 3,
+    "Jupiter": 2,
+    "Saturn": 2,
+    "Uranus": 1,
+    "Neptune": 1,
+    "Pluto": 1,
+    "North Node": 2,
+    "South Node": 2,
+    "Chiron": 1,
+    "Ceres": 1,
+    "Pallas": 1,
+    "Juno": 1,
+    "Vesta": 1,
+}
 
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 ASPECT_SPECS = (
@@ -482,6 +555,15 @@ def whole_sign_house_for_longitude(planet_lon: float, asc_lon: float) -> int:
     return ((planet_sign - asc_sign) % 12) + 1
 
 
+def find_matching_aspect(delta: float) -> Optional[Tuple[str, float, float]]:
+    best_match: Optional[Tuple[str, float, float]] = None
+    for aspect_name, aspect_angle, max_orb in ASPECT_SPECS:
+        orb = abs(delta - aspect_angle)
+        if orb <= max_orb and (best_match is None or orb < best_match[2]):
+            best_match = (aspect_name, aspect_angle, orb)
+    return best_match
+
+
 def compute_major_aspects(longitudes: Dict[str, float]) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     bodies = list(longitudes.keys())
@@ -492,12 +574,7 @@ def compute_major_aspects(longitudes: Dict[str, float]) -> List[Dict[str, Any]]:
         delta = abs(lon1 - lon2) % 360.0
         delta = min(delta, 360.0 - delta)
 
-        best_match: Optional[Tuple[str, float, float]] = None
-        for aspect_name, aspect_angle, max_orb in ASPECT_SPECS:
-            orb = abs(delta - aspect_angle)
-            if orb <= max_orb and (best_match is None or orb < best_match[2]):
-                best_match = (aspect_name, aspect_angle, orb)
-
+        best_match = find_matching_aspect(delta)
         if best_match is not None:
             aspect_name, aspect_angle, orb = best_match
             results.append(
@@ -512,6 +589,288 @@ def compute_major_aspects(longitudes: Dict[str, float]) -> List[Dict[str, Any]]:
 
     results.sort(key=lambda item: item["orb"])
     return results
+
+
+def compute_body_positions(
+    jd: float,
+    zodiac: Literal["tropical", "sidereal"],
+    house_cusps: Optional[List[float]] = None,
+    asc_lon: Optional[float] = None,
+    house_system: Literal["whole_sign", "placidus"] = "whole_sign",
+) -> Tuple[List[Dict[str, Any]], Dict[str, float], bool, List[str]]:
+    flag = swe.FLG_SWIEPH | swe.FLG_SPEED
+    if zodiac == "sidereal":
+        flag |= swe.FLG_SIDEREAL
+
+    placements: List[Dict[str, Any]] = []
+    body_longitudes: Dict[str, float] = {}
+    nodes_included = False
+    asteroids_included: List[str] = []
+
+    for name, pid in PLANETS.items():
+        body_lon = calc_longitude(jd, pid, flag) % 360.0
+        sign, deg = lon_to_sign_deg(body_lon)
+        placement: Dict[str, Any] = {
+            "body": name,
+            "longitude": round(body_lon, 6),
+            "sign": sign,
+            "degree_in_sign": round(deg, 3),
+        }
+        if house_cusps is not None:
+            if house_system == "whole_sign" and asc_lon is not None:
+                placement["house"] = whole_sign_house_for_longitude(body_lon, asc_lon)
+            else:
+                placement["house"] = house_for_longitude(body_lon, house_cusps)
+        placements.append(placement)
+        body_longitudes[name] = body_lon
+
+    if "North Node" in NODE_BODIES:
+        north_node_lon = calc_longitude(jd, NODE_BODIES["North Node"], flag) % 360.0
+        south_node_lon = (north_node_lon + 180.0) % 360.0
+        for node_name, node_lon in (("North Node", north_node_lon), ("South Node", south_node_lon)):
+            sign, deg = lon_to_sign_deg(node_lon)
+            node_placement: Dict[str, Any] = {
+                "body": node_name,
+                "longitude": round(node_lon, 6),
+                "sign": sign,
+                "degree_in_sign": round(deg, 3),
+            }
+            if house_cusps is not None:
+                if house_system == "whole_sign" and asc_lon is not None:
+                    node_placement["house"] = whole_sign_house_for_longitude(node_lon, asc_lon)
+                else:
+                    node_placement["house"] = house_for_longitude(node_lon, house_cusps)
+            placements.append(node_placement)
+            body_longitudes[node_name] = node_lon
+        nodes_included = True
+
+    for asteroid_name, asteroid_id in ASTEROID_BODIES.items():
+        asteroid_lon = calc_longitude(jd, asteroid_id, flag) % 360.0
+        sign, deg = lon_to_sign_deg(asteroid_lon)
+        asteroid_placement: Dict[str, Any] = {
+            "body": asteroid_name,
+            "longitude": round(asteroid_lon, 6),
+            "sign": sign,
+            "degree_in_sign": round(deg, 3),
+        }
+        if house_cusps is not None:
+            if house_system == "whole_sign" and asc_lon is not None:
+                asteroid_placement["house"] = whole_sign_house_for_longitude(asteroid_lon, asc_lon)
+            else:
+                asteroid_placement["house"] = house_for_longitude(asteroid_lon, house_cusps)
+        placements.append(asteroid_placement)
+        body_longitudes[asteroid_name] = asteroid_lon
+        asteroids_included.append(asteroid_name)
+
+    return placements, body_longitudes, nodes_included, asteroids_included
+
+
+def resolve_transit_moment(
+    transit_date: Optional[date],
+    transit_time: Optional[time],
+) -> Tuple[date, time, bool]:
+    if transit_date is None and transit_time is None:
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        return now_utc.date(), time(now_utc.hour, now_utc.minute, now_utc.second), True
+    if transit_date is None:
+        now_utc = datetime.now(ZoneInfo("UTC"))
+        return now_utc.date(), transit_time, False
+    if transit_time is None:
+        return transit_date, time(12, 0, 0), False
+    return transit_date, transit_time, False
+
+
+def compute_transit_positions(
+    transit_date: date,
+    transit_time: time,
+    transit_timezone_offset_hours: float,
+    zodiac: Literal["tropical", "sidereal"],
+) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+    jd = parse_datetime_to_jd(
+        transit_date,
+        transit_time,
+        transit_timezone_offset_hours,
+    )
+    placements, transit_longitudes, _, _ = compute_body_positions(jd=jd, zodiac=zodiac)
+    return placements, transit_longitudes
+
+
+def compute_transit_aspects(
+    natal_longitudes: Dict[str, float],
+    transit_longitudes: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+
+    for transit_body, transit_lon in transit_longitudes.items():
+        for natal_body, natal_lon in natal_longitudes.items():
+            delta = abs(transit_lon - natal_lon) % 360.0
+            delta = min(delta, 360.0 - delta)
+
+            best_match = find_matching_aspect(delta)
+            if best_match is None:
+                continue
+
+            aspect_name, aspect_angle, orb = best_match
+            results.append(
+                {
+                    "between": [f"Transit {transit_body}", f"Natal {natal_body}"],
+                    "type": aspect_name,
+                    "angle": aspect_angle,
+                    "delta": round(delta, 3),
+                    "orb": round(orb, 3),
+                }
+            )
+
+    results.sort(key=lambda item: item["orb"])
+    return results
+
+
+def summarize_element_modality(placements: List[Dict[str, Any]]) -> Dict[str, Any]:
+    elements = {"Fire": 0, "Earth": 0, "Air": 0, "Water": 0}
+    modalities = {"Cardinal": 0, "Fixed": 0, "Mutable": 0}
+
+    for placement in placements:
+        body = placement.get("body")
+        sign = placement.get("sign")
+        if body not in DOMINANCE_BODIES or sign not in SIGN_TO_ELEMENT:
+            continue
+        elements[SIGN_TO_ELEMENT[sign]] += 1
+        modalities[SIGN_TO_MODALITY[sign]] += 1
+
+    def dominant_label(counts: Dict[str, int]) -> str:
+        highest = max(counts.values()) if counts else 0
+        if highest == 0:
+            return "None"
+        leaders = [name for name, count in counts.items() if count == highest]
+        if len(leaders) == 1:
+            return leaders[0]
+        return "Tie: " + ", ".join(leaders)
+
+    return {
+        "elements": elements,
+        "modalities": modalities,
+        "dominant_element": dominant_label(elements),
+        "dominant_modality": dominant_label(modalities),
+    }
+
+
+def detect_stelliums(placements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    configurations: List[Dict[str, Any]] = []
+    sign_buckets: Dict[str, List[str]] = {}
+    house_buckets: Dict[int, List[str]] = {}
+
+    for placement in placements:
+        body = placement.get("body")
+        sign = placement.get("sign")
+        house = placement.get("house")
+        if body is None:
+            continue
+        if sign:
+            sign_buckets.setdefault(sign, []).append(body)
+        if isinstance(house, int):
+            house_buckets.setdefault(house, []).append(body)
+
+    for sign in SIGNS:
+        bodies = sign_buckets.get(sign, [])
+        if len(bodies) >= 3:
+            configurations.append(
+                {
+                    "type": "sign_stellium",
+                    "sign": sign,
+                    "bodies": bodies,
+                }
+            )
+
+    for house in sorted(house_buckets):
+        bodies = house_buckets[house]
+        if len(bodies) >= 3:
+            configurations.append(
+                {
+                    "type": "house_stellium",
+                    "house": house,
+                    "bodies": bodies,
+                }
+            )
+
+    return configurations
+
+
+def compute_chart_ruler(meta: Dict[str, Any]) -> Optional[str]:
+    angles = meta.get("angles")
+    if not isinstance(angles, dict) or "asc" not in angles:
+        return None
+    asc_sign, _ = lon_to_sign_deg(float(angles["asc"]))
+    return TRADITIONAL_SIGN_RULERS.get(asc_sign)
+
+
+def compute_planetary_strength_index(
+    placements: List[Dict[str, Any]],
+    aspects: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    placement_order = [placement["body"] for placement in placements if "body" in placement]
+    scores = {
+        body: PLANETARY_STRENGTH_BASE.get(body, 0)
+        for body in placement_order
+    }
+
+    chart_ruler = compute_chart_ruler(meta)
+    if chart_ruler in scores:
+        scores[chart_ruler] += 4
+
+    angular_houses = {1, 4, 7, 10}
+    succedent_houses = {2, 5, 8, 11}
+    luminaries = {"Sun", "Moon"}
+
+    for placement in placements:
+        body = placement.get("body")
+        house = placement.get("house")
+        if body not in scores or not isinstance(house, int):
+            continue
+        if house in angular_houses:
+            scores[body] += 3
+        elif house in succedent_houses:
+            scores[body] += 2
+        else:
+            scores[body] += 1
+
+    for aspect in aspects:
+        between = aspect.get("between", [])
+        orb = float(aspect.get("orb", 999.0))
+        aspect_bonus = 0
+        if orb <= 1:
+            aspect_bonus = 4
+        elif orb <= 2:
+            aspect_bonus = 3
+        elif orb <= 4:
+            aspect_bonus = 2
+        elif orb <= 6:
+            aspect_bonus = 1
+
+        for body in between:
+            if body in scores:
+                scores[body] += aspect_bonus
+
+        if len(between) == 2:
+            body_a, body_b = between
+            if body_a in luminaries and body_b in scores:
+                scores[body_b] += 2
+            if body_b in luminaries and body_a in scores:
+                scores[body_a] += 2
+
+    stellium_bodies = {
+        body
+        for configuration in detect_stelliums(placements)
+        for body in configuration.get("bodies", [])
+        if body in scores
+    }
+    for body in stellium_bodies:
+        scores[body] += 4
+
+    return sorted(
+        ({"body": body, "score": score} for body, score in scores.items()),
+        key=lambda item: (-item["score"], placement_order.index(item["body"])),
+    )
 
 
 def compute_natal_chart(
@@ -542,9 +901,6 @@ def compute_natal_chart(
     jd = parse_datetime_to_jd(birth_date, birth_time, timezone_offset_hours)
 
     swe.set_topo(birth_lon, birth_lat, 0)
-    flag = swe.FLG_SWIEPH | swe.FLG_SPEED
-    if zodiac == "sidereal":
-        flag |= swe.FLG_SIDEREAL
 
     houses_included = birth_time is not None
     house_cusps: Optional[List[float]] = None
@@ -562,69 +918,13 @@ def compute_natal_chart(
             "mc": round(mc, 6),
         }
 
-    placements: List[Dict[str, Any]] = []
-    planet_longitudes: Dict[str, float] = {}
-    nodes_included = False
-    asteroids_included: List[str] = []
-    north_node_lon: Optional[float] = None
-    south_node_lon: Optional[float] = None
-    for name, pid in PLANETS.items():
-        planet_lon = calc_longitude(jd, pid, flag) % 360.0
-        sign, deg = lon_to_sign_deg(planet_lon)
-        placement: Dict[str, Any] = {
-            "body": name,
-            "longitude": round(planet_lon, 6),
-            "sign": sign,
-            "degree_in_sign": round(deg, 3),
-        }
-        if house_cusps is not None:
-            if house_system == "whole_sign" and asc_lon is not None:
-                placement["house"] = whole_sign_house_for_longitude(planet_lon, asc_lon)
-            else:
-                placement["house"] = house_for_longitude(planet_lon, house_cusps)
-        placements.append(placement)
-        planet_longitudes[name] = planet_lon
-
-    if "North Node" in NODE_BODIES:
-        north_node_lon = calc_longitude(jd, NODE_BODIES["North Node"], flag) % 360.0
-        south_node_lon = (north_node_lon + 180.0) % 360.0
-        for node_name, node_lon in [("North Node", north_node_lon), ("South Node", south_node_lon)]:
-            sign, deg = lon_to_sign_deg(node_lon)
-            node_placement: Dict[str, Any] = {
-                "body": node_name,
-                "longitude": round(node_lon, 6),
-                "sign": sign,
-                "degree_in_sign": round(deg, 3),
-            }
-            if house_cusps is not None:
-                if house_system == "whole_sign" and asc_lon is not None:
-                    node_placement["house"] = whole_sign_house_for_longitude(node_lon, asc_lon)
-                else:
-                    node_placement["house"] = house_for_longitude(node_lon, house_cusps)
-            placements.append(node_placement)
-        nodes_included = True
-
-    for asteroid_name, asteroid_id in ASTEROID_BODIES.items():
-        asteroid_lon = calc_longitude(jd, asteroid_id, flag) % 360.0
-        sign, deg = lon_to_sign_deg(asteroid_lon)
-        asteroid_placement: Dict[str, Any] = {
-            "body": asteroid_name,
-            "longitude": round(asteroid_lon, 6),
-            "sign": sign,
-            "degree_in_sign": round(deg, 3),
-        }
-        if house_cusps is not None:
-            if house_system == "whole_sign" and asc_lon is not None:
-                asteroid_placement["house"] = whole_sign_house_for_longitude(asteroid_lon, asc_lon)
-            else:
-                asteroid_placement["house"] = house_for_longitude(asteroid_lon, house_cusps)
-        placements.append(asteroid_placement)
-        planet_longitudes[asteroid_name] = asteroid_lon
-        asteroids_included.append(asteroid_name)
-
-    if north_node_lon is not None and south_node_lon is not None:
-        planet_longitudes["North Node"] = north_node_lon
-        planet_longitudes["South Node"] = south_node_lon
+    placements, planet_longitudes, nodes_included, asteroids_included = compute_body_positions(
+        jd=jd,
+        zodiac=zodiac,
+        house_cusps=house_cusps,
+        asc_lon=asc_lon,
+        house_system=house_system,
+    )
 
     aspects = compute_major_aspects(planet_longitudes)
 
@@ -672,12 +972,76 @@ def compute_natal_chart(
         elif body in asteroid_bodies:
             grouped_placements["asteroids"].append(placement)
 
+    element_modality_summary = summarize_element_modality(placements)
+    configurations = detect_stelliums(placements)
+    planetary_strength_index = compute_planetary_strength_index(placements, aspects, meta)
+    chart_summary = {
+        "dominant_element": element_modality_summary["dominant_element"],
+        "dominant_modality": element_modality_summary["dominant_modality"],
+        "elements": element_modality_summary["elements"],
+        "modalities": element_modality_summary["modalities"],
+        "configurations": configurations,
+        "planetary_strength_index": planetary_strength_index,
+    }
+
     return {
         "meta": meta,
         "placements": placements,
         "grouped_placements": grouped_placements,
         "aspects": aspects,
+        "chart_summary": chart_summary,
     }
+
+
+def build_natal_chart_for_person(
+    person: BirthData,
+    zodiac: Literal["tropical", "sidereal"],
+    house_system: Literal["whole_sign", "placidus"],
+) -> Dict[str, Any]:
+    location_input = build_place(person)
+    location_input = " ".join(location_input.strip().split())
+    if not location_input:
+        raise ValueError("place could not be built from city/state/country.")
+
+    if (person.lat is None) != (person.lon is None):
+        raise ValueError("Provide both lat and lon or neither.")
+
+    if person.lat is None and person.lon is None and person.timezone_offset_hours is None:
+        return copy.deepcopy(
+            compute_natal_chart_cached(
+                birth_date=person.date,
+                birth_time=person.birth_time,
+                city=person.city,
+                state=person.state,
+                country=person.country,
+                zodiac=zodiac,
+                house_system=house_system,
+            )
+        )
+
+    if person.lat is not None and person.lon is not None:
+        birth_lat = person.lat
+        birth_lon = person.lon
+        location_resolved = location_input
+    else:
+        birth_lat, birth_lon, location_resolved = geocode_place(
+            person.city, person.state, person.country
+        )
+
+    return compute_natal_chart(
+        birth_date=person.date,
+        birth_time=person.birth_time,
+        city=person.city,
+        state=person.state,
+        country=person.country,
+        zodiac=zodiac,
+        house_system=house_system,
+        location_input=location_input,
+        birth_lat=birth_lat,
+        birth_lon=birth_lon,
+        timezone_offset_hours=person.timezone_offset_hours,
+        location_resolved=location_resolved,
+    )
 
 
 @lru_cache(maxsize=512)
@@ -879,49 +1243,10 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
 
         sanity_check_ephemeris()
 
-        p = req.person
-
-        location_input = build_place(p)
-        location_input = " ".join(location_input.strip().split())
-        if not location_input:
-            raise ValueError("place could not be built from city/state/country.")
-
-        if (p.lat is None) != (p.lon is None):
-            raise ValueError("Provide both lat and lon or neither.")
-
-        if p.lat is None and p.lon is None and p.timezone_offset_hours is None:
-            return copy.deepcopy(
-                compute_natal_chart_cached(
-                    birth_date=p.date,
-                    birth_time=p.birth_time,
-                    city=p.city,
-                    state=p.state,
-                    country=p.country,
-                    zodiac=req.zodiac,
-                    house_system=req.house_system,
-                )
-            )
-
-        if p.lat is not None and p.lon is not None:
-            birth_lat = p.lat
-            birth_lon = p.lon
-            location_resolved = location_input
-        else:
-            birth_lat, birth_lon, location_resolved = geocode_place(p.city, p.state, p.country)
-
-        return compute_natal_chart(
-            birth_date=p.date,
-            birth_time=p.birth_time,
-            city=p.city,
-            state=p.state,
-            country=p.country,
+        return build_natal_chart_for_person(
+            person=req.person,
             zodiac=req.zodiac,
             house_system=req.house_system,
-            location_input=location_input,
-            birth_lat=birth_lat,
-            birth_lon=birth_lon,
-            timezone_offset_hours=p.timezone_offset_hours,
-            location_resolved=location_resolved,
         )
 
     except HTTPException:
@@ -932,6 +1257,73 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         print(f"Internal error in /natal: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/transits")
+def transits(req: TransitRequest) -> Dict[str, Any]:
+    try:
+        if swe is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Swiss Ephemeris not available"
+            )
+
+        sanity_check_ephemeris()
+
+        natal_chart = build_natal_chart_for_person(
+            person=req.person,
+            zodiac=req.zodiac,
+            house_system="whole_sign",
+        )
+        natal_longitudes = placements_to_longitude_map(natal_chart["placements"])
+
+        user_supplied_transit_moment = req.transit_date is not None or req.transit_time is not None
+        if user_supplied_transit_moment and req.transit_timezone_offset_hours is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "To calculate transits accurately for that exact time, I need the timezone "
+                    "or city for the transit moment. Otherwise I can calculate it using UTC or "
+                    "your current timezone as an assumption."
+                ),
+            )
+
+        resolved_transit_date, resolved_transit_time, used_utc_defaults = resolve_transit_moment(
+            req.transit_date,
+            req.transit_time,
+        )
+        resolved_transit_offset = 0.0 if used_utc_defaults else req.transit_timezone_offset_hours
+        transit_placements, transit_longitudes = compute_transit_positions(
+            transit_date=resolved_transit_date,
+            transit_time=resolved_transit_time,
+            transit_timezone_offset_hours=resolved_transit_offset,
+            zodiac=req.zodiac,
+        )
+
+        return {
+            "meta": {
+                "chart_type": "transits",
+                "transit_date": resolved_transit_date,
+                "transit_time": resolved_transit_time,
+                "transit_timezone_offset_hours": resolved_transit_offset,
+                "transit_timezone_source": "utc_now" if used_utc_defaults else "input",
+                "zodiac": req.zodiac,
+            },
+            "natal_placements": natal_chart["placements"],
+            "transit_placements": transit_placements,
+            "transit_aspects": compute_transit_aspects(natal_longitudes, transit_longitudes),
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        print(f"Error in /transits: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"Internal error in /transits: {exc}")
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
