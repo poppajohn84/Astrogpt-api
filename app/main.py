@@ -102,6 +102,13 @@ class CompositeRequest(BaseModel):
     house_system: Literal["whole_sign", "placidus"] = "whole_sign"
 
 
+class SynastryRequest(BaseModel):
+    person_a: BirthData
+    person_b: BirthData
+    zodiac: Literal["tropical", "sidereal"] = "tropical"
+    house_system: Literal["whole_sign", "placidus"] = "whole_sign"
+
+
 # --------- Helpers ---------
 PLANETS = (
     {
@@ -723,6 +730,92 @@ def compute_transit_aspects(
 
     results.sort(key=lambda item: item["orb"])
     return results
+
+
+def build_synastry_natal_charts(
+    person_a: BirthData,
+    person_b: BirthData,
+    zodiac: Literal["tropical", "sidereal"],
+    house_system: Literal["whole_sign", "placidus"],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def build_chart(person: BirthData, label: str) -> Dict[str, Any]:
+        try:
+            return build_natal_chart_for_person(
+                person=person,
+                zodiac=zodiac,
+                house_system=house_system,
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not generate natal chart for {label}: {detail}",
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not generate natal chart for {label}: {exc}",
+            ) from exc
+
+    return build_chart(person_a, "person_a"), build_chart(person_b, "person_b")
+
+
+def compute_synastry_aspects(
+    map_a: Dict[str, float],
+    map_b: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+
+    for body_a, lon_a in map_a.items():
+        for body_b, lon_b in map_b.items():
+            delta = abs(lon_a - lon_b) % 360.0
+            delta = min(delta, 360.0 - delta)
+
+            best_match = find_matching_aspect(delta)
+            if best_match is None:
+                continue
+
+            aspect_name, aspect_angle, orb = best_match
+            results.append(
+                {
+                    "between": [f"{body_a} (A)", f"{body_b} (B)"],
+                    "type": aspect_name,
+                    "angle": aspect_angle,
+                    "delta": round(delta, 3),
+                    "orb": round(orb, 3),
+                }
+            )
+
+    results.sort(key=lambda item: item["orb"])
+    return results
+
+
+def build_exact_chart_snapshot(chart: Dict[str, Any]) -> Dict[str, Any]:
+    placements = {
+        placement["body"]: placement
+        for placement in chart.get("placements", [])
+        if "body" in placement
+    }
+    meta = chart.get("meta", {})
+
+    sun_placement = placements.get("Sun")
+    moon_placement = placements.get("Moon")
+    if sun_placement is None or moon_placement is None:
+        raise ValueError("Synastry requires confirmed Sun and Moon placements.")
+
+    snapshot: Dict[str, Any] = {
+        "sun_sign": sun_placement["sign"],
+        "moon_sign": moon_placement["sign"],
+    }
+
+    angles = meta.get("angles")
+    if isinstance(angles, dict) and "asc" in angles:
+        rising_sign, _ = lon_to_sign_deg(float(angles["asc"]))
+        snapshot["rising_sign"] = rising_sign
+    else:
+        snapshot["rising_sign"] = "Unavailable without birth time"
+
+    return snapshot
 
 
 def summarize_element_modality(placements: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1354,5 +1447,57 @@ def composite(req: CompositeRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         print(f"Internal error in /composite: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/synastry")
+def synastry(req: SynastryRequest) -> Dict[str, Any]:
+    try:
+        if swe is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Swiss Ephemeris not available"
+            )
+
+        sanity_check_ephemeris()
+
+        chart_a, chart_b = build_synastry_natal_charts(
+            person_a=req.person_a,
+            person_b=req.person_b,
+            zodiac=req.zodiac,
+            house_system=req.house_system,
+        )
+
+        synastry_aspects = compute_synastry_aspects(
+            placements_to_longitude_map(chart_a["placements"]),
+            placements_to_longitude_map(chart_b["placements"]),
+        )
+
+        return {
+            "meta": {
+                "chart_type": "synastry",
+                "zodiac": req.zodiac,
+                "house_system": req.house_system,
+                "birth_time_used_a": bool(chart_a.get("meta", {}).get("time_provided")),
+                "birth_time_used_b": bool(chart_b.get("meta", {}).get("time_provided")),
+            },
+            "chart_a": chart_a,
+            "chart_b": chart_b,
+            "chart_snapshot": {
+                "person_a": build_exact_chart_snapshot(chart_a),
+                "person_b": build_exact_chart_snapshot(chart_b),
+            },
+            "synastry_aspects": synastry_aspects,
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        print(f"Error in /synastry: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"Internal error in /synastry: {exc}")
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
