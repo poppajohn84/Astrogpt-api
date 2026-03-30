@@ -1,6 +1,8 @@
 import copy
+import html
 from functools import lru_cache
 from itertools import combinations
+import math
 from pathlib import Path
 import traceback
 import time as time_module
@@ -19,6 +21,7 @@ from app.schemas import (
     normalize_profile_name,
 )
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.responses import Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from timezonefinder import TimezoneFinder
@@ -85,6 +88,15 @@ class NatalRequest(BaseModel):
     person: BirthData
     zodiac: Literal["tropical", "sidereal"] = "tropical"
     house_system: Literal["whole_sign", "placidus"] = "whole_sign"
+
+
+class NatalChartImageRequest(BaseModel):
+    person: BirthData
+    zodiac: Literal["tropical", "sidereal"] = "tropical"
+    house_system: Literal["whole_sign", "placidus"] = "whole_sign"
+    width: int = 900
+    height: int = 900
+    include_aspects: bool = True
 
 
 class TransitRequest(BaseModel):
@@ -236,6 +248,62 @@ ASPECT_SPECS = (
 HOUSE_SYSTEM_CODE = {
     "whole_sign": b"W",
     "placidus": b"P",
+}
+SIGN_LABELS = [
+    "Aries",
+    "Taurus",
+    "Gemini",
+    "Cancer",
+    "Leo",
+    "Virgo",
+    "Libra",
+    "Scorpio",
+    "Sagittarius",
+    "Capricorn",
+    "Aquarius",
+    "Pisces",
+]
+SIGN_GLYPHS = {
+    "Aries": "♈",
+    "Taurus": "♉",
+    "Gemini": "♊",
+    "Cancer": "♋",
+    "Leo": "♌",
+    "Virgo": "♍",
+    "Libra": "♎",
+    "Scorpio": "♏",
+    "Sagittarius": "♐",
+    "Capricorn": "♑",
+    "Aquarius": "♒",
+    "Pisces": "♓",
+}
+PLANET_GLYPHS = {
+    "Sun": "☉",
+    "Moon": "☽",
+    "Mercury": "☿",
+    "Venus": "♀",
+    "Mars": "♂",
+    "Jupiter": "♃",
+    "Saturn": "♄",
+    "Uranus": "♅",
+    "Neptune": "♆",
+    "Pluto": "♇",
+}
+NODE_GLYPHS = {
+    "North Node": "☊",
+    "South Node": "☋",
+}
+ASTEROID_LABELS = {
+    "Chiron": "Ch",
+    "Ceres": "Ce",
+    "Pallas": "Pa",
+    "Juno": "Ju",
+    "Vesta": "Ve",
+}
+BODY_LABELS = {
+    **PLANET_GLYPHS,
+    **NODE_GLYPHS,
+    **ASTEROID_LABELS,
 }
 TIMEZONE_FINDER = TimezoneFinder(in_memory=True)
 GEOCODE_HEADERS = {"User-Agent": "AstroGPT/1.0 (contact: admin@yourdomain.com)"}
@@ -788,6 +856,238 @@ def compute_synastry_aspects(
 
     results.sort(key=lambda item: item["orb"])
     return results
+
+
+def polar_to_cartesian(cx: float, cy: float, radius: float, angle_deg: float) -> Tuple[float, float]:
+    radians = math.radians(angle_deg - 90.0)
+    return (
+        cx + (radius * math.cos(radians)),
+        cy + (radius * math.sin(radians)),
+    )
+
+
+def longitude_to_wheel_angle(longitude: float, asc_longitude: Optional[float] = None) -> float:
+    reference = asc_longitude if asc_longitude is not None else 0.0
+    relative_longitude = (longitude - reference) % 360.0
+    # Screen coordinates increase clockwise; subtract the zodiac delta so the wheel
+    # progresses in the standard astrological direction while keeping ASC at 9 o'clock.
+    return (270.0 - relative_longitude) % 360.0
+
+
+def svg_line(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    stroke: str = "#1f2933",
+    stroke_width: float = 1.0,
+    opacity: float = 1.0,
+    dasharray: Optional[str] = None,
+) -> str:
+    dash_attr = f' stroke-dasharray="{html.escape(dasharray, quote=True)}"' if dasharray else ""
+    return (
+        f'<line x1="{x1:.3f}" y1="{y1:.3f}" x2="{x2:.3f}" y2="{y2:.3f}" '
+        f'stroke="{html.escape(stroke, quote=True)}" stroke-width="{stroke_width:.3f}" '
+        f'opacity="{opacity:.3f}" stroke-linecap="round"{dash_attr} />'
+    )
+
+
+def svg_circle(
+    cx: float,
+    cy: float,
+    radius: float,
+    stroke: str = "#1f2933",
+    stroke_width: float = 1.0,
+    fill: str = "none",
+    opacity: float = 1.0,
+) -> str:
+    return (
+        f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="{radius:.3f}" '
+        f'stroke="{html.escape(stroke, quote=True)}" stroke-width="{stroke_width:.3f}" '
+        f'fill="{html.escape(fill, quote=True)}" opacity="{opacity:.3f}" />'
+    )
+
+
+def svg_text(
+    x: float,
+    y: float,
+    text: str,
+    font_size: float = 12.0,
+    fill: str = "#1f2933",
+    text_anchor: str = "middle",
+    dominant_baseline: str = "middle",
+    font_weight: str = "normal",
+    rotate: Optional[float] = None,
+) -> str:
+    rotate_attr = (
+        f' transform="rotate({rotate:.3f} {x:.3f} {y:.3f})"'
+        if rotate is not None
+        else ""
+    )
+    return (
+        f'<text x="{x:.3f}" y="{y:.3f}" font-size="{font_size:.3f}" '
+        f'fill="{html.escape(fill, quote=True)}" text-anchor="{html.escape(text_anchor, quote=True)}" '
+        f'dominant-baseline="{html.escape(dominant_baseline, quote=True)}" '
+        f'font-family="Helvetica, Arial, sans-serif" '
+        f'font-weight="{html.escape(font_weight, quote=True)}"{rotate_attr}>'
+        f"{html.escape(text)}"
+        "</text>"
+    )
+
+
+def build_natal_chart_svg(
+    chart: Dict[str, Any],
+    width: int,
+    height: int,
+    include_aspects: bool,
+) -> str:
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive integers.")
+
+    placements = [
+        placement
+        for placement in chart.get("placements", [])
+        if "body" in placement and "longitude" in placement
+    ]
+    if not placements:
+        raise ValueError("Natal chart did not include placements.")
+
+    meta = chart.get("meta", {})
+    angles = meta.get("angles") if isinstance(meta.get("angles"), dict) else {}
+    asc_longitude = float(angles["asc"]) if isinstance(angles, dict) and "asc" in angles else None
+    house_cusps = meta.get("house_cusps") if isinstance(meta.get("house_cusps"), list) else []
+
+    cx = width / 2.0
+    cy = height / 2.0
+    outer_radius = min(width, height) * 0.46
+    zodiac_inner_radius = outer_radius * 0.86
+    planet_ring_radius = outer_radius * 0.72
+    house_inner_radius = outer_radius * 0.30
+    aspect_radius = outer_radius * 0.22
+    label_font_size = max(10.0, outer_radius * 0.035)
+    sign_font_size = max(11.0, outer_radius * 0.040)
+    angle_font_size = max(10.0, outer_radius * 0.034)
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" role="img" aria-label="Natal chart wheel">',
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#ffffff" />',
+        svg_circle(cx, cy, outer_radius, stroke="#111111", stroke_width=2.2),
+        svg_circle(cx, cy, zodiac_inner_radius, stroke="#111111", stroke_width=1.6),
+        svg_circle(cx, cy, planet_ring_radius, stroke="#444444", stroke_width=1.0, opacity=0.7),
+        svg_circle(cx, cy, house_inner_radius, stroke="#555555", stroke_width=1.0, opacity=0.65),
+    ]
+
+    if include_aspects and chart.get("aspects"):
+        placement_map = {
+            str(placement["body"]): placement
+            for placement in placements
+        }
+        for aspect in chart["aspects"]:
+            between = aspect.get("between")
+            if not isinstance(between, list) or len(between) != 2:
+                continue
+            body_a, body_b = str(between[0]), str(between[1])
+            placement_a = placement_map.get(body_a)
+            placement_b = placement_map.get(body_b)
+            if placement_a is None or placement_b is None:
+                continue
+            angle_a = longitude_to_wheel_angle(float(placement_a["longitude"]), asc_longitude)
+            angle_b = longitude_to_wheel_angle(float(placement_b["longitude"]), asc_longitude)
+            x1, y1 = polar_to_cartesian(cx, cy, aspect_radius, angle_a)
+            x2, y2 = polar_to_cartesian(cx, cy, aspect_radius, angle_b)
+            parts.append(svg_line(x1, y1, x2, y2, stroke="#7a7a7a", stroke_width=1.2, opacity=0.55))
+
+    for sign_index, sign_name in enumerate(SIGN_LABELS):
+        boundary_angle = longitude_to_wheel_angle(sign_index * 30.0, asc_longitude)
+        inner_x, inner_y = polar_to_cartesian(cx, cy, zodiac_inner_radius, boundary_angle)
+        outer_x, outer_y = polar_to_cartesian(cx, cy, outer_radius, boundary_angle)
+        parts.append(svg_line(inner_x, inner_y, outer_x, outer_y, stroke="#111111", stroke_width=1.2))
+
+        label_angle = longitude_to_wheel_angle((sign_index * 30.0) + 15.0, asc_longitude)
+        label_x, label_y = polar_to_cartesian(
+            cx,
+            cy,
+            (outer_radius + zodiac_inner_radius) / 2.0,
+            label_angle,
+        )
+        parts.append(
+            svg_text(
+                label_x,
+                label_y,
+                SIGN_GLYPHS.get(sign_name, sign_name),
+                font_size=sign_font_size,
+                fill="#111111",
+                font_weight="bold",
+            )
+        )
+
+    if len(house_cusps) == 12:
+        for idx, cusp in enumerate(house_cusps):
+            cusp_angle = longitude_to_wheel_angle(float(cusp), asc_longitude)
+            start_x, start_y = polar_to_cartesian(cx, cy, house_inner_radius, cusp_angle)
+            end_x, end_y = polar_to_cartesian(cx, cy, zodiac_inner_radius, cusp_angle)
+            stroke_width = 1.8 if idx in (0, 9) else 1.0
+            parts.append(
+                svg_line(start_x, start_y, end_x, end_y, stroke="#2f2f2f", stroke_width=stroke_width, opacity=0.85)
+            )
+
+    if isinstance(angles, dict):
+        for key, label in (("asc", "ASC"), ("mc", "MC")):
+            if key not in angles:
+                continue
+            angle = longitude_to_wheel_angle(float(angles[key]), asc_longitude)
+            start_x, start_y = polar_to_cartesian(cx, cy, house_inner_radius * 0.75, angle)
+            end_x, end_y = polar_to_cartesian(cx, cy, outer_radius + 10.0, angle)
+            label_x, label_y = polar_to_cartesian(cx, cy, outer_radius + 24.0, angle)
+            parts.append(svg_line(start_x, start_y, end_x, end_y, stroke="#000000", stroke_width=2.4))
+            parts.append(
+                svg_text(
+                    label_x,
+                    label_y,
+                    label,
+                    font_size=angle_font_size,
+                    fill="#000000",
+                    font_weight="bold",
+                )
+            )
+
+    sorted_placements = sorted(
+        placements,
+        key=lambda placement: longitude_to_wheel_angle(float(placement["longitude"]), asc_longitude),
+    )
+    last_angle: Optional[float] = None
+    cluster_depth = 0
+
+    for placement in sorted_placements:
+        body = str(placement["body"])
+        angle = longitude_to_wheel_angle(float(placement["longitude"]), asc_longitude)
+        if last_angle is not None and (angle - last_angle) < 7.5:
+            cluster_depth += 1
+        else:
+            cluster_depth = 0
+        last_angle = angle
+
+        marker_radius = planet_ring_radius - (cluster_depth % 3) * 12.0
+        label_radius = marker_radius - 22.0 - (cluster_depth // 3) * 10.0
+        marker_x, marker_y = polar_to_cartesian(cx, cy, marker_radius, angle)
+        label_x, label_y = polar_to_cartesian(cx, cy, label_radius, angle)
+
+        parts.append(svg_line(label_x, label_y, marker_x, marker_y, stroke="#666666", stroke_width=0.9, opacity=0.75))
+        parts.append(svg_circle(marker_x, marker_y, 4.2, stroke="#111111", stroke_width=1.1, fill="#ffffff"))
+        parts.append(
+            svg_text(
+                label_x,
+                label_y,
+                BODY_LABELS.get(body, body),
+                font_size=label_font_size,
+                fill="#111111",
+                font_weight="bold",
+            )
+        )
+
+    parts.append("</svg>")
+    return "\n".join(parts)
 
 
 def build_exact_chart_snapshot(chart: Dict[str, Any]) -> Dict[str, Any]:
@@ -1352,6 +1652,58 @@ def natal(req: NatalRequest) -> Dict[str, Any]:
         print(f"Internal error in /natal: {exc}")
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/chart-image/natal")
+def natal_chart_image(req: NatalChartImageRequest) -> Dict[str, Any]:
+    try:
+        if swe is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Swiss Ephemeris not available"
+            )
+
+        sanity_check_ephemeris()
+
+        chart = build_natal_chart_for_person(
+            person=req.person,
+            zodiac=req.zodiac,
+            house_system=req.house_system,
+        )
+        svg = build_natal_chart_svg(
+            chart=chart,
+            width=req.width,
+            height=req.height,
+            include_aspects=req.include_aspects,
+        )
+
+        return {
+            "meta": {
+                "chart_type": "natal_svg",
+                "width": req.width,
+                "height": req.height,
+                "zodiac": req.zodiac,
+                "house_system": req.house_system,
+            },
+            "svg": svg,
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        print(f"Error in /chart-image/natal: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"Internal error in /chart-image/natal: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/chart-image/natal/raw")
+def natal_chart_image_raw(req: NatalChartImageRequest) -> Response:
+    result = natal_chart_image(req)
+    return Response(content=result["svg"], media_type="image/svg+xml")
 
 
 @app.post("/transits")
