@@ -264,34 +264,34 @@ SIGN_LABELS = [
     "Pisces",
 ]
 SIGN_GLYPHS = {
-    "Aries": "♈",
-    "Taurus": "♉",
-    "Gemini": "♊",
-    "Cancer": "♋",
-    "Leo": "♌",
-    "Virgo": "♍",
-    "Libra": "♎",
-    "Scorpio": "♏",
-    "Sagittarius": "♐",
-    "Capricorn": "♑",
-    "Aquarius": "♒",
-    "Pisces": "♓",
+    "Aries": "\u2648",
+    "Taurus": "\u2649",
+    "Gemini": "\u264A",
+    "Cancer": "\u264B",
+    "Leo": "\u264C",
+    "Virgo": "\u264D",
+    "Libra": "\u264E",
+    "Scorpio": "\u264F",
+    "Sagittarius": "\u2650",
+    "Capricorn": "\u2651",
+    "Aquarius": "\u2652",
+    "Pisces": "\u2653",
 }
 PLANET_GLYPHS = {
-    "Sun": "☉",
-    "Moon": "☽",
-    "Mercury": "☿",
-    "Venus": "♀",
-    "Mars": "♂",
-    "Jupiter": "♃",
-    "Saturn": "♄",
-    "Uranus": "♅",
-    "Neptune": "♆",
-    "Pluto": "♇",
+    "Sun": "\u2609",
+    "Moon": "\u263D",
+    "Mercury": "\u263F",
+    "Venus": "\u2640",
+    "Mars": "\u2642",
+    "Jupiter": "\u2643",
+    "Saturn": "\u2644",
+    "Uranus": "\u2645",
+    "Neptune": "\u2646",
+    "Pluto": "\u2647",
 }
 NODE_GLYPHS = {
-    "North Node": "☊",
-    "South Node": "☋",
+    "North Node": "\u260A",
+    "South Node": "\u260B",
 }
 ASTEROID_LABELS = {
     "Chiron": "Ch",
@@ -869,8 +869,8 @@ def polar_to_cartesian(cx: float, cy: float, radius: float, angle_deg: float) ->
 def longitude_to_wheel_angle(longitude: float, asc_longitude: Optional[float] = None) -> float:
     reference = asc_longitude if asc_longitude is not None else 0.0
     relative_longitude = (longitude - reference) % 360.0
-    # Screen coordinates increase clockwise; subtract the zodiac delta so the wheel
-    # progresses in the standard astrological direction while keeping ASC at 9 o'clock.
+    # Keep ASC fixed at 9 o'clock, then reverse the rendered wheel by
+    # subtracting the zodiac delta from the left-hand anchor.
     return (270.0 - relative_longitude) % 360.0
 
 
@@ -1040,6 +1040,14 @@ def build_natal_chart_svg(
             start_x, start_y = polar_to_cartesian(cx, cy, house_inner_radius * 0.75, angle)
             end_x, end_y = polar_to_cartesian(cx, cy, outer_radius + 10.0, angle)
             label_x, label_y = polar_to_cartesian(cx, cy, outer_radius + 24.0, angle)
+            if label_x > cx + 8.0:
+                angle_text_anchor = "start"
+                label_x += 6.0
+            elif label_x < cx - 8.0:
+                angle_text_anchor = "end"
+                label_x -= 6.0
+            else:
+                angle_text_anchor = "middle"
             parts.append(svg_line(start_x, start_y, end_x, end_y, stroke="#000000", stroke_width=2.4))
             parts.append(
                 svg_text(
@@ -1048,43 +1056,68 @@ def build_natal_chart_svg(
                     label,
                     font_size=angle_font_size,
                     fill="#000000",
+                    text_anchor=angle_text_anchor,
                     font_weight="bold",
                 )
             )
 
-    sorted_placements = sorted(
-        placements,
-        key=lambda placement: longitude_to_wheel_angle(float(placement["longitude"]), asc_longitude),
+    placement_entries = sorted(
+        [
+            {
+                "placement": placement,
+                "angle": longitude_to_wheel_angle(float(placement["longitude"]), asc_longitude),
+            }
+            for placement in placements
+        ],
+        key=lambda entry: float(entry["angle"]),
     )
-    last_angle: Optional[float] = None
-    cluster_depth = 0
+    cluster_threshold = 7.5
+    body_clusters: List[List[Dict[str, Any]]] = []
 
-    for placement in sorted_placements:
-        body = str(placement["body"])
-        angle = longitude_to_wheel_angle(float(placement["longitude"]), asc_longitude)
-        if last_angle is not None and (angle - last_angle) < 7.5:
-            cluster_depth += 1
+    for entry in placement_entries:
+        if not body_clusters:
+            body_clusters.append([entry])
+            continue
+        previous_angle = float(body_clusters[-1][-1]["angle"])
+        if (float(entry["angle"]) - previous_angle) < cluster_threshold:
+            body_clusters[-1].append(entry)
         else:
-            cluster_depth = 0
-        last_angle = angle
+            body_clusters.append([entry])
 
-        marker_radius = planet_ring_radius - (cluster_depth % 3) * 12.0
-        label_radius = marker_radius - 22.0 - (cluster_depth // 3) * 10.0
-        marker_x, marker_y = polar_to_cartesian(cx, cy, marker_radius, angle)
-        label_x, label_y = polar_to_cartesian(cx, cy, label_radius, angle)
+    if len(body_clusters) > 1:
+        wrap_gap = (float(body_clusters[0][0]["angle"]) + 360.0) - float(body_clusters[-1][-1]["angle"])
+        if wrap_gap < cluster_threshold:
+            body_clusters[0] = body_clusters[-1] + body_clusters[0]
+            body_clusters.pop()
 
-        parts.append(svg_line(label_x, label_y, marker_x, marker_y, stroke="#666666", stroke_width=0.9, opacity=0.75))
-        parts.append(svg_circle(marker_x, marker_y, 4.2, stroke="#111111", stroke_width=1.1, fill="#ffffff"))
-        parts.append(
-            svg_text(
-                label_x,
-                label_y,
-                BODY_LABELS.get(body, body),
-                font_size=label_font_size,
-                fill="#111111",
-                font_weight="bold",
+    min_marker_radius = house_inner_radius + 42.0
+    min_label_radius = house_inner_radius + 18.0
+    stagger_step = 14.0
+
+    for cluster in body_clusters:
+        for cluster_index, entry in enumerate(cluster):
+            placement = entry["placement"]
+            body = str(placement["body"])
+            angle = float(entry["angle"])
+            marker_radius = max(min_marker_radius, planet_ring_radius - (cluster_index * stagger_step))
+            label_radius = max(min_label_radius, marker_radius - 22.0 - (cluster_index * 2.0))
+            marker_x, marker_y = polar_to_cartesian(cx, cy, marker_radius, angle)
+            label_x, label_y = polar_to_cartesian(cx, cy, label_radius, angle)
+
+            parts.append(
+                svg_line(label_x, label_y, marker_x, marker_y, stroke="#666666", stroke_width=0.9, opacity=0.75)
             )
-        )
+            parts.append(svg_circle(marker_x, marker_y, 4.2, stroke="#111111", stroke_width=1.1, fill="#ffffff"))
+            parts.append(
+                svg_text(
+                    label_x,
+                    label_y,
+                    BODY_LABELS.get(body, body),
+                    font_size=label_font_size,
+                    fill="#111111",
+                    font_weight="bold",
+                )
+            )
 
     parts.append("</svg>")
     return "\n".join(parts)
